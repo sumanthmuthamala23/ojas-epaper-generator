@@ -2,12 +2,20 @@ import os
 import io
 import json
 import base64
+import tempfile
 import datetime
 import urllib.parse
 import requests
 from PIL import Image
 import streamlit as st
 import streamlit.components.v1 as components
+
+# Optional OpenCV for extracting thumbnail frame from uploaded video
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
 
 # Optional Gemini SDK for instant bilingual translation/headline polish
 try:
@@ -44,6 +52,53 @@ def image_to_base64(uploaded_file, max_width=1200) -> str:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+def extract_video_thumbnail_b64(video_file) -> str:
+    """Extracts a sharp cover frame from an uploaded video file and returns base64 JPEG."""
+    if not HAS_CV2 or video_file is None:
+        return ""
+    try:
+        suffix = os.path.splitext(video_file.name)[1] or ".mp4"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(video_file.getvalue())
+            tmp_path = tmp.name
+
+        cap = cv2.VideoCapture(tmp_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        target_frame = min(30, max(0, total_frames // 5))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        ret, frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
+        cap.release()
+        os.remove(tmp_path)
+
+        if ret and frame is not None:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(frame_rgb)
+            if pil_img.width > 1200:
+                ratio = 1200 / float(pil_img.width)
+                pil_img = pil_img.resize((1200, int(pil_img.height * ratio)), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=90)
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        pass
+    return ""
+
+def generate_qr_base64(url: str) -> str:
+    """Generates a clean QR code image as base64 PNG for playable video links in PDF/print."""
+    if not url or not url.strip():
+        return ""
+    try:
+        qr_api = f"https://api.qrserver.com/v1/create-qr-code/?size=160x160&margin=4&data={urllib.parse.quote(url.strip())}"
+        res = requests.get(qr_api, timeout=5)
+        if res.status_code == 200:
+            return base64.b64encode(res.content).decode("utf-8")
+    except Exception:
+        pass
+    return ""
 
 def transliterate_to_telugu(text: str) -> str:
     """Free, unlimited phonetic English-to-Telugu converter (no API key required)."""
@@ -225,14 +280,14 @@ with st.sidebar:
 st.markdown("""
 <div class="top-brand-bar">
     <h1>📰 OJAS — Power of Information (ఓజస్) E-Paper Studio</h1>
-    <p>Create bilingual Telugu & English newspaper clippings with 1 or 2 photos and export in HD JPEG & PDF</p>
+    <p>Attach up to 2 Photos + Playable Video Report • Export Bilingual Newspaper in HD JPEG & Interactive PDF</p>
 </div>
 """, unsafe_allow_html=True)
 
 col_editor, col_preview = st.columns([1.05, 1.25], gap="large")
 
 with col_editor:
-    st.subheader("✍️ 1. News Content & Photos")
+    st.subheader("✍️ 1. News Content, Photos & Video")
 
     if gemini_key and HAS_GENAI:
         with st.expander("🤖 Quick AI Bilingual Translator & Editor", expanded=False):
@@ -263,7 +318,12 @@ with col_editor:
             if phonetic_in.strip():
                 st.code(transliterate_to_telugu(phonetic_in), language=None)
 
-    tab_te, tab_en, tab_img = st.tabs(["తెలుగు వార్త (Telugu)", "🇬🇧 English News", "📸 Photos (1 or 2)"])
+    tab_te, tab_en, tab_photos, tab_video = st.tabs([
+        "తెలుగు వార్త",
+        "🇬🇧 English News",
+        "📸 Photos (Max 2)",
+        "🎬 Video Attachment"
+    ])
 
     with tab_te:
         st.session_state["te_headline"] = st.text_input(
@@ -295,27 +355,75 @@ with col_editor:
             height=190
         )
 
-    with tab_img:
-        st.info("Upload **1 photo** for a wide feature banner, or **2 photos** for a dual-frame newspaper layout.")
-        uploaded_photos = st.file_uploader(
-            "Choose 1 or 2 Photos (JPG, PNG, WEBP)",
-            type=["jpg", "jpeg", "png", "webp"],
-            accept_multiple_files=True
-        )
+    # TAB 3: DEDICATED 1 OR 2 PHOTO SLOTS
+    with tab_photos:
+        st.info("Attach **1 Photo** (Full-Width Hero Banner) or **2 Photos** (Side-by-Side Newspaper Grid). Maximum 2 photos.")
         photo_b64_list = []
         captions = []
-        if uploaded_photos:
-            selected_photos = uploaded_photos[:2]
-            if len(uploaded_photos) > 2:
-                st.warning("Showing the first 2 photos for optimal newspaper layout.")
-            for idx, p_file in enumerate(selected_photos):
-                photo_b64_list.append(image_to_base64(p_file))
-                cap = st.text_input(
-                    f"Caption for Photo {idx + 1} (Telugu / English)",
-                    value=f"కార్యక్రమంలో పాల్గొన్న దృశ్యం / Glimpse from the event ({idx + 1})",
-                    key=f"cap_{idx}"
+
+        p_col1, p_col2 = st.columns(2)
+        with p_col1:
+            photo_1 = st.file_uploader(
+                "📷 Photo 1 (Primary)",
+                type=["jpg", "jpeg", "png", "webp"],
+                key="photo_slot_1"
+            )
+            if photo_1 is not None:
+                photo_b64_list.append(image_to_base64(photo_1))
+                cap1 = st.text_input(
+                    "Photo 1 Caption",
+                    value="కార్యక్రమంలో పాల్గొన్న దృశ్యం / Event highlight (1)",
+                    key="cap_slot_1"
                 )
-                captions.append(cap)
+                captions.append(cap1)
+
+        with p_col2:
+            photo_2 = st.file_uploader(
+                "📷 Photo 2 (Optional)",
+                type=["jpg", "jpeg", "png", "webp"],
+                key="photo_slot_2"
+            )
+            if photo_2 is not None:
+                photo_b64_list.append(image_to_base64(photo_2))
+                cap2 = st.text_input(
+                    "Photo 2 Caption",
+                    value="సమావేశంలో మాట్లాడుతున్న దృశ్యం / Event highlight (2)",
+                    key="cap_slot_2"
+                )
+                captions.append(cap2)
+
+    # TAB 4: VIDEO ATTACHMENT & INTERACTIVE PDF VIDEO PLAYER
+    with tab_video:
+        st.markdown("##### 🎥 Attach News Video (Plays in Live E-Paper & Clickable in PDF)")
+        uploaded_video = st.file_uploader(
+            "Upload Video File (MP4, MOV, WEBM)",
+            type=["mp4", "mov", "webm"],
+            key="news_video_file"
+        )
+        video_play_url = st.text_input(
+            "🔗 Video Play Link (YouTube / Google Drive / Facebook / X URL for PDF Click-to-Play)",
+            placeholder="https://youtu.be/... or https://drive.google.com/file/d/.../view",
+            help="When readers tap the video frame inside the downloaded PDF on any phone or PC, it immediately opens and plays this video."
+        )
+        video_caption = st.text_input(
+            "Video News Headline / Strip Label",
+            value="వీడియో కథనం చూడటానికి ఇక్కడ క్లిక్ చేయండి • TAP TO WATCH FULL VIDEO REPORT"
+        )
+
+        video_thumb_b64 = ""
+        if uploaded_video is not None:
+            st.video(uploaded_video)
+            video_thumb_b64 = extract_video_thumbnail_b64(uploaded_video)
+            if not video_play_url.strip():
+                st.caption("💡 Tip: Paste a YouTube or Google Drive share link above so anyone opening the exported PDF can tap the video box to play it online.")
+
+        custom_video_thumb = st.file_uploader(
+            "🖼️ Custom Video Cover Image (Optional - auto-captured from video if uploaded)",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="custom_vid_thumb"
+        )
+        if custom_video_thumb is not None:
+            video_thumb_b64 = image_to_base64(custom_video_thumb)
 
     footer_credit = st.text_input(
         "Reporter / Bureau Footer Line",
@@ -331,11 +439,12 @@ logo_html = (
     '<div style="font-size:44px; font-weight:900; color:#991b1b; letter-spacing:2px;">OJAS</div><div style="font-size:13px; font-weight:700;">POWER OF INFORMATION • ఓజస్</div>'
 )
 
+# Photo Grid HTML (1 or 2 photos)
 photos_html = ""
 if len(photo_b64_list) == 1:
     photos_html = f"""
-    <div style="margin: 12px 0 14px 0; border: 1px solid #cbd5e1; padding: 5px; background: #fff;">
-        <img src="data:image/jpeg;base64,{photo_b64_list[0]}" style="width: 100%; max-height: 320px; object-fit: cover; display: block;">
+    <div style="margin: 10px 0 12px 0; border: 1px solid #cbd5e1; padding: 5px; background: #fff;">
+        <img src="data:image/jpeg;base64,{photo_b64_list[0]}" style="width: 100%; max-height: 310px; object-fit: cover; display: block;">
         <div style="font-size: 11.5px; color: #334155; padding: 5px 4px 2px 4px; font-weight: 600; border-top: 1px solid #e2e8f0; margin-top: 4px;">
             ▲ {captions[0]}
         </div>
@@ -343,14 +452,56 @@ if len(photo_b64_list) == 1:
     """
 elif len(photo_b64_list) >= 2:
     photos_html = f"""
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 12px 0 14px 0;">
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0 12px 0;">
         <div style="border: 1px solid #cbd5e1; padding: 4px; background: #fff;">
-            <img src="data:image/jpeg;base64,{photo_b64_list[0]}" style="width: 100%; height: 210px; object-fit: cover; display: block;">
+            <img src="data:image/jpeg;base64,{photo_b64_list[0]}" style="width: 100%; height: 205px; object-fit: cover; display: block;">
             <div style="font-size: 11px; color: #334155; padding-top: 4px; font-weight: 600;">▲ {captions[0]}</div>
         </div>
         <div style="border: 1px solid #cbd5e1; padding: 4px; background: #fff;">
-            <img src="data:image/jpeg;base64,{photo_b64_list[1]}" style="width: 100%; height: 210px; object-fit: cover; display: block;">
+            <img src="data:image/jpeg;base64,{photo_b64_list[1]}" style="width: 100%; height: 205px; object-fit: cover; display: block;">
             <div style="font-size: 11px; color: #334155; padding-top: 4px; font-weight: 600;">▲ {captions[1]}</div>
+        </div>
+    </div>
+    """
+
+# Video Box HTML (Cinema Newspaper Frame + Play Overlay + QR Code for PDF/Print)
+has_video_section = bool(uploaded_video is not None or video_play_url.strip() or video_thumb_b64)
+qr_b64 = generate_qr_base64(video_play_url) if video_play_url.strip() else ""
+
+video_box_html = ""
+if has_video_section:
+    thumb_visual = (
+        f'<img src="data:image/jpeg;base64,{video_thumb_b64}" style="width:100%; height:220px; object-fit:cover; display:block; filter: brightness(0.82);">'
+        if video_thumb_b64 else
+        '<div style="width:100%; height:150px; background: linear-gradient(135deg, #0f172a 0%, #991b1b 100%);"></div>'
+    )
+    qr_html = (
+        f'<div style="background:#fff; padding:4px; border-radius:6px; text-align:center; border:1px solid #cbd5e1;">'
+        f'<img src="data:image/png;base64,{qr_b64}" style="width:58px; height:58px; display:block;">'
+        f'<div style="font-size:8px; font-weight:800; color:#0f172a; margin-top:2px;">SCAN TO PLAY</div></div>'
+        if qr_b64 else ""
+    )
+    clean_url_display = video_play_url.strip() if video_play_url.strip() else "Attached Digital Video Clip • OJAS E-Paper"
+
+    video_box_html = f"""
+    <div id="video-hotspot" style="margin: 12px 0 14px 0; border: 2px solid #991b1b; background: #0f172a; border-radius: 6px; overflow: hidden; position: relative;">
+        <div style="position: relative; width: 100%;">
+            {thumb_visual}
+            <div style="position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(0,0,0,0.28);">
+                <div style="width: 58px; height: 58px; border-radius: 50%; background: rgba(220, 38, 38, 0.95); border: 3px solid #ffffff; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 18px rgba(0,0,0,0.45);">
+                    <div style="width: 0; height: 0; border-top: 11px solid transparent; border-bottom: 11px solid transparent; border-left: 18px solid #ffffff; margin-left: 4px;"></div>
+                </div>
+                <div style="margin-top: 8px; background: rgba(15, 23, 42, 0.88); color: #fef3c7; font-size: 11px; font-weight: 800; padding: 4px 12px; border-radius: 20px; border: 1px solid #f59e0b; letter-spacing: 0.4px;">
+                    ▶ {video_caption}
+                </div>
+            </div>
+        </div>
+        <div style="background: #fffbeb; padding: 7px 12px; display: flex; justify-content: space-between; align-items: center; gap: 10px; border-top: 1.5px solid #991b1b;">
+            <div style="flex: 1;">
+                <div style="font-size: 10.5px; font-weight: 800; color: #991b1b; text-transform: uppercase;">🎬 OJAS MULTIMEDIA VIDEO BULLETIN</div>
+                <div style="font-size: 11px; color: #1e293b; font-weight: 600; word-break: break-all;">{clean_url_display}</div>
+            </div>
+            {qr_html}
         </div>
     </div>
     """
@@ -422,8 +573,9 @@ else:
     """
 
 safe_filename = f"OJAS_News_{pub_date.strftime('%Y%m%d')}"
+escaped_video_url = json.dumps(video_play_url.strip())
 
-# ----------------- RIGHT COLUMN: LIVE NEWSPAPER & INSTANT JPEG / PDF DOWNLOAD -----------------
+# ----------------- RIGHT COLUMN: LIVE NEWSPAPER & INSTANT JPEG / CLICKABLE VIDEO PDF -----------------
 with col_preview:
     st.subheader("🗞️ 2. Live Newspaper Preview & Export")
 
@@ -536,7 +688,7 @@ with col_preview:
     <body>
         <div class="toolbar">
             <button class="btn btn-jpg" onclick="downloadJPEG()">🖼️ Download HD JPEG</button>
-            <button class="btn btn-pdf" onclick="downloadPDF()">📄 Download PDF</button>
+            <button class="btn btn-pdf" onclick="downloadPDF()">📄 Download Playable Video PDF</button>
         </div>
         <div id="status-msg"></div>
 
@@ -553,6 +705,8 @@ with col_preview:
 
             {photos_html}
 
+            {video_box_html}
+
             {news_columns_html}
 
             <div class="footer-strip">
@@ -562,6 +716,8 @@ with col_preview:
         </div>
 
         <script>
+            const VIDEO_URL = {escaped_video_url};
+
             async function renderSheetCanvas() {{
                 const status = document.getElementById('status-msg');
                 status.innerText = "⏳ Generating high-resolution print edition...";
@@ -583,7 +739,7 @@ with col_preview:
                     link.download = "{safe_filename}.jpg";
                     link.href = canvas.toDataURL("image/jpeg", 0.95);
                     link.click();
-                    document.getElementById('status-msg').innerText = "✅ JPEG downloaded!";
+                    document.getElementById('status-msg').innerText = "✅ HD JPEG downloaded!";
                 }} catch (err) {{
                     document.getElementById('status-msg').innerText = "⚠️ Error: " + err;
                 }}
@@ -591,6 +747,14 @@ with col_preview:
 
             async function downloadPDF() {{
                 try {{
+                    const sheetEl = document.getElementById('newspaper-sheet');
+                    const sheetRect = sheetEl.getBoundingClientRect();
+                    const videoEl = document.getElementById('video-hotspot');
+                    let videoRect = null;
+                    if (videoEl) {{
+                        videoRect = videoEl.getBoundingClientRect();
+                    }}
+
                     const canvas = await renderSheetCanvas();
                     const imgData = canvas.toDataURL("image/jpeg", 0.96);
                     const {{ jsPDF }} = window.jspdf;
@@ -614,8 +778,20 @@ with col_preview:
                     }}
                     const xOffset = (pageWidth - finalWidth) / 2;
                     pdf.addImage(imgData, "JPEG", xOffset, margin, finalWidth, finalHeight);
+
+                    // Embed clickable interactive Video Link hotspot directly over the video frame in PDF
+                    if (videoRect && VIDEO_URL) {{
+                        const scaleX = finalWidth / sheetRect.width;
+                        const scaleY = finalHeight / sheetRect.height;
+                        const linkX = xOffset + (videoRect.left - sheetRect.left) * scaleX;
+                        const linkY = margin + (videoRect.top - sheetRect.top) * scaleY;
+                        const linkW = videoRect.width * scaleX;
+                        const linkH = videoRect.height * scaleY;
+                        pdf.link(linkX, linkY, linkW, linkH, {{ url: VIDEO_URL }});
+                    }}
+
                     pdf.save("{safe_filename}.pdf");
-                    document.getElementById('status-msg').innerText = "✅ PDF downloaded!";
+                    document.getElementById('status-msg').innerText = "✅ Interactive PDF downloaded!";
                 }} catch (err) {{
                     document.getElementById('status-msg').innerText = "⚠️ Error: " + err;
                 }}
@@ -625,4 +801,4 @@ with col_preview:
     </html>
     """
 
-    components.html(newspaper_widget_html, height=1060, scrolling=True)
+    components.html(newspaper_widget_html, height=1180, scrolling=True)
