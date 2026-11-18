@@ -1,6 +1,8 @@
 import os
+import re
 import io
 import json
+import time
 import base64
 import tempfile
 import datetime
@@ -17,7 +19,7 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-# Optional Gemini SDK for instant bilingual translation/headline polish
+# Optional Gemini SDK for Chief-Editor AI bilingual translation & condensation
 try:
     from google import genai
     from google.genai import types
@@ -100,6 +102,47 @@ def generate_qr_base64(url: str) -> str:
         pass
     return ""
 
+def detect_telugu(text: str) -> bool:
+    """Detects whether the input text is predominantly in Telugu script."""
+    te_chars = len(re.findall(r'[\u0C00-\u0C7F]', text))
+    en_chars = len(re.findall(r'[A-Za-z]', text))
+    return te_chars > en_chars
+
+def free_translate_text(text: str, source_lang: str, target_lang: str) -> str:
+    """Free unlimited fallback translator between Telugu ('te') and English ('en')."""
+    if not text.strip():
+        return ""
+    try:
+        url = (
+            "https://translate.googleapis.com/translate_a/single"
+            f"?client=gtx&sl={source_lang}&tl={target_lang}&dt=t&q={urllib.parse.quote(text[:4500])}"
+        )
+        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+        data = res.json()
+        return "".join([seg[0] for seg in data[0] if seg[0]]).strip()
+    except Exception:
+        return text
+
+def smart_condense_to_word_budget(text: str, max_words: int) -> str:
+    """Trims text cleanly at sentence boundaries to fit single-page column budgets."""
+    cleaned = re.sub(r'\n{2,}', '\n', text.strip())
+    words = cleaned.split()
+    if len(words) <= max_words:
+        return cleaned
+    sentences = re.split(r'(?<=[.!?।])\s+', cleaned)
+    out = []
+    count = 0
+    for s in sentences:
+        w = len(s.split())
+        if count + w <= max_words:
+            out.append(s)
+            count += w
+        else:
+            break
+    if not out:
+        return " ".join(words[:max_words]) + "..."
+    return " ".join(out)
+
 def transliterate_to_telugu(text: str) -> str:
     """Free, unlimited phonetic English-to-Telugu converter (no API key required)."""
     if not text.strip():
@@ -128,36 +171,125 @@ def transliterate_to_telugu(text: str) -> str:
         converted_lines.append(" ".join(out_words))
     return "\n".join(converted_lines)
 
-def ai_bilingual_assist(api_key: str, source_text: str, location: str):
-    """Generates crisp newspaper headlines and bilingual Telugu + English body."""
-    client = genai.Client(api_key=api_key.strip())
-    prompt = f"""
-    You are the Chief Editor of 'OJAS - Power of Information' (ఓజస్), a premier Telugu-English bilingual newspaper.
-    Convert the following raw news notes into a polished, publication-ready bilingual newspaper report.
-    Location/Dateline: {location}
+def ai_editorial_bilingual_engine(
+    keys: list,
+    raw_input: str,
+    location: str,
+    target_te_words: int,
+    target_en_words: int,
+    editorial_style: str
+) -> dict:
+    """
+    Chief-Editor AI Newsroom Engine:
+    - Auto-detects Telugu or English input
+    - Translates & transcreates into authentic Telugu (పత్రికా భాష) AND crisp English
+    - Applies Inverted Pyramid editing & word-budget condensation to fit 1 single page cleanly
+    """
+    last_err = None
+    models_pool = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-3.5-flash-lite"]
 
-    Raw Input:
-    {source_text}
+    prompt = f"""
+    You are the Chief News Editor & Copy Desk Director of 'OJAS - Power of Information' (ఓజస్), a premier Telugu-English bilingual daily newspaper.
+
+    TASK:
+    1. Detect the language of the RAW NEWS INPUT below (it may be in Telugu, English, or mixed Tanglish).
+    2. If the input is in Telugu -> retain/refine the Telugu into crisp journalistic Telugu (పత్రికా భాష) AND translate/transcreate it into sharp English newspaper copy.
+    3. If the input is in English -> refine it into sharp English newspaper copy AND translate/transcreate it into authentic journalistic Telugu (పత్రికా భాష).
+    4. SUPERFICIAL & STRUCTURAL NEWS EDITING TECHNIQUES:
+       - Apply the Inverted Pyramid rule (Lead with Who, What, Where, When, Impact in sentence 1).
+       - Cut redundant filler words, passive phrasing, and repetitive greetings so the entire bilingual story fits comfortably on ONE SINGLE PAGE without overflowing.
+       - Editorial Angle: {editorial_style}
+       - Dateline / Place: {location}
+       - STRICT WORD BUDGET: Keep `te_body` around {target_te_words} words (maximum {target_te_words + 15} words) and `en_body` around {target_en_words} words (maximum {target_en_words + 15} words). Use 1 or 2 tight paragraphs with NO blank lines between them.
+
+    RAW NEWS INPUT:
+    {raw_input}
 
     Return STRICTLY valid JSON with these exact keys (no markdown fences):
     {{
-        "te_headline": "Punchy journalistic Telugu headline",
-        "te_subhead": "Short Telugu sub-headline (1 line)",
-        "te_body": "Standard journalistic Telugu news report (2-3 crisp paragraphs)",
-        "en_headline": "Punchy journalistic English headline",
-        "en_subhead": "Short English sub-headline (1 line)",
-        "en_body": "Standard journalistic English news report (2-3 crisp paragraphs)"
+        "te_headline": "Punchy 5-8 word journalistic Telugu headline",
+        "te_subhead": "Crisp 1-line Telugu deck sub-headline",
+        "te_body": "Edited journalistic Telugu body within {target_te_words} words",
+        "en_headline": "Punchy 6-10 word journalistic English headline",
+        "en_subhead": "Crisp 1-line English deck sub-headline",
+        "en_body": "Edited journalistic English body within {target_en_words} words"
     }}
     """
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.3,
-            response_mime_type="application/json"
-        )
-    )
-    return json.loads(response.text)
+
+    for key in keys:
+        if not key or not key.strip():
+            continue
+        try:
+            client = genai.Client(api_key=key.strip())
+            for m_name in models_pool:
+                try:
+                    res = client.models.generate_content(
+                        model=m_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.25,
+                            response_mime_type="application/json"
+                        )
+                    )
+                    if res and res.text:
+                        return json.loads(res.text)
+                except Exception as e:
+                    last_err = e
+                    time.sleep(0.6)
+                    continue
+        except Exception as ce:
+            last_err = ce
+            continue
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("No valid Gemini API key provided.")
+
+def process_bilingual_auto_fit(
+    keys: list,
+    raw_text: str,
+    location: str,
+    target_te_words: int,
+    target_en_words: int,
+    editorial_style: str
+) -> dict:
+    """Runs AI Chief Editor if API key is present; otherwise runs free two-way translation + smart single-page condenser."""
+    valid_keys = [k for k in keys if k and k.strip()]
+    if valid_keys and HAS_GENAI:
+        try:
+            return ai_editorial_bilingual_engine(
+                valid_keys, raw_text, location, target_te_words, target_en_words, editorial_style
+            )
+        except Exception as e:
+            st.warning(f"AI key busy ({e}) — switching to instant free bilingual translator & condenser.")
+
+    # Free Unlimited Fallback (Zero API Key Needed)
+    is_te = detect_telugu(raw_text)
+    lines = [l.strip() for l in raw_text.strip().split("\n") if l.strip()]
+    first_line = lines[0] if lines else raw_text.strip()[:70]
+    body_raw = " ".join(lines[1:]) if len(lines) > 1 else raw_text.strip()
+
+    if is_te:
+        te_head = first_line[:90]
+        te_body = smart_condense_to_word_budget(body_raw, target_te_words)
+        en_head = free_translate_text(te_head, "te", "en")
+        en_body_full = free_translate_text(body_raw, "te", "en")
+        en_body = smart_condense_to_word_budget(en_body_full, target_en_words)
+    else:
+        en_head = first_line[:95]
+        en_body = smart_condense_to_word_budget(body_raw, target_en_words)
+        te_head = free_translate_text(en_head, "en", "te")
+        te_body_full = free_translate_text(body_raw, "en", "te")
+        te_body = smart_condense_to_word_budget(te_body_full, target_te_words)
+
+    return {
+        "te_headline": te_head,
+        "te_subhead": "",
+        "te_body": te_body,
+        "en_headline": en_head,
+        "en_subhead": "",
+        "en_body": en_body,
+    }
 
 # ----------------- CUSTOM RESPONSIVE APP STYLING -----------------
 st.markdown("""
@@ -176,21 +308,21 @@ st.markdown("""
     .top-brand-bar {
         background: linear-gradient(90deg, #991b1b 0%, #b91c1c 60%, #d97706 100%);
         color: white;
-        padding: 16px 24px;
-        border-radius: 14px;
-        margin-bottom: 18px;
-        box-shadow: 0 6px 20px rgba(153, 27, 27, 0.22);
+        padding: 14px 22px;
+        border-radius: 12px;
+        margin-bottom: 16px;
+        box-shadow: 0 6px 18px rgba(153, 27, 27, 0.2);
     }
     .top-brand-bar h1 {
         color: white !important;
         margin: 0 !important;
-        font-size: 22px !important;
+        font-size: 21px !important;
         font-weight: 800 !important;
     }
     .top-brand-bar p {
         color: #fef3c7 !important;
-        margin: 4px 0 0 0 !important;
-        font-size: 13.5px !important;
+        margin: 3px 0 0 0 !important;
+        font-size: 13px !important;
     }
     div.stButton > button[kind="primary"] {
         background: linear-gradient(90deg, #991b1b 0%, #dc2626 100%) !important;
@@ -198,12 +330,12 @@ st.markdown("""
         font-weight: 700 !important;
         border-radius: 10px !important;
         border: none !important;
-        padding: 10px 22px !important;
+        padding: 10px 20px !important;
     }
     @media screen and (max-width: 768px) {
-        .top-brand-bar { padding: 12px 15px !important; }
-        .top-brand-bar h1 { font-size: 18px !important; }
-        .block-container { padding-left: 0.75rem !important; padding-right: 0.75rem !important; }
+        .top-brand-bar { padding: 11px 14px !important; }
+        .top-brand-bar h1 { font-size: 17px !important; }
+        .block-container { padding-left: 0.65rem !important; padding-right: 0.65rem !important; }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -212,10 +344,11 @@ st.markdown("""
 defaults = {
     "te_headline": "ప్రజా సమస్యల పరిష్కారమే లక్ష్యంగా ప్రత్యేక కార్యాచరణ",
     "te_subhead": "అధికారులు క్షేత్రస్థాయిలో పర్యటించి తక్షణ చర్యలు చేపట్టాలి",
-    "te_body": "కోదాడ, న్యూస్‌టుడే: పట్టణ మరియు గ్రామీణ ప్రాంతాల్లో ప్రజలు ఎదుర్కొంటున్న మౌలిక వసతుల సమస్యలను యుద్ధప్రాతిపదికన పరిష్కరించేందుకు ప్రత్యేక ప్రణాళిక సిద్ధం చేసినట్లు అధికారులు వెల్లడించారు. తాగునీరు, రహదారులు, పారిశుద్ధ్య పనులపై ప్రత్యేక దృష్టి సారించామన్నారు.",
+    "te_body": "కోదాడ, న్యూస్‌టుడే: పట్టణ, గ్రామీణ ప్రాంతాల్లో ప్రజలు ఎదుర్కొంటున్న మౌలిక వసతుల సమస్యలను యుద్ధప్రాతిపదికన పరిష్కరించేందుకు ప్రత్యేక ప్రణాళిక సిద్ధం చేసినట్లు అధికారులు వెల్లడించారు. తాగునీరు, రహదారులు, పారిశుద్ధ్య పనులపై ప్రత్యేక దృష్టి సారించి గడువులోగా పూర్తి చేయాలని ఆదేశించారు.",
     "en_headline": "Special Action Plan Launched to Resolve Public Grievances",
     "en_subhead": "Officials directed to conduct field visits and ensure swift redressal",
-    "en_body": "KODAD: Authorities have rolled out a dedicated action plan aimed at resolving civic and infrastructure challenges across urban and rural pockets on a war footing. Priority is being accorded to drinking water supply, road repairs, and sanitation works.",
+    "en_body": "KODAD: Authorities have rolled out a dedicated action plan to resolve civic and infrastructure issues across urban and rural pockets on a war footing. Officials have been instructed to prioritize drinking water supply, road repairs, and sanitation works with strict timelines.",
+    "raw_bilingual_input": ""
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -226,23 +359,31 @@ with st.sidebar:
     logo_b64 = load_logo_base64()
     if logo_b64:
         st.markdown(
-            f'<div style="background:#fff; padding:10px; border-radius:10px; border:1px solid #e2e8f0; text-align:center; margin-bottom:12px;">'
+            f'<div style="background:#fff; padding:8px; border-radius:10px; border:1px solid #e2e8f0; text-align:center; margin-bottom:10px;">'
             f'<img src="data:image/png;base64,{logo_b64}" style="max-width:100%; height:auto;"></div>',
             unsafe_allow_html=True
         )
     else:
         st.warning("⚠️ Upload `OJAS.png` to your GitHub repo to display the masthead logo.")
 
-    st.subheader("📐 1. Page Aspect Ratio & Screen Fit")
+    st.subheader("📐 1. Single-Page Format & Ratio")
     aspect_preset = st.radio(
-        "Choose Edition Aspect Ratio:",
+        "Choose Edition Ratio:",
         [
-            "📰 Broadsheet E-Paper (A4 / iPad / Computer — Wide)",
-            "📱 9:16 Vertical E-Paper (Mobile / WhatsApp Status)",
-            "📐 9:16 Tall Broadsheet (Full Article Vertical)"
+            "📰 Broadsheet E-Paper (A4 / iPad / Computer — 1 Page)",
+            "📱 9:16 Vertical E-Paper (Mobile / WhatsApp Status — 1 Page)"
         ],
-        index=0,
-        help="Broadsheet gives a wide, balanced newspaper page on iPad, PC, and A4 PDF without thin vertical stretching. 9:16 optimizes for phone screens & WhatsApp Status."
+        index=0
+    )
+
+    editorial_style = st.selectbox(
+        "🧠 AI News Editing Technique",
+        [
+            "Inverted Pyramid • Crisp Breaking News",
+            "Print Daily Standard • Eenadu / Sakshi Style",
+            "Official Statement • Authoritative Press Tone",
+            "Civic & Welfare Spotlight • Human-Interest Lead"
+        ]
     )
 
     st.subheader("🗞️ 2. Edition & Masthead Details")
@@ -279,49 +420,36 @@ with st.sidebar:
     )
 
     st.divider()
-    with st.expander("✨ Optional AI Bilingual Auto-Writer"):
-        st.caption("Paste rough notes in English or Telugu to auto-generate both languages. Leave blank for 100% manual unlimited mode.")
+    with st.expander("🔑 Gemini API Key (Optional for AI Copy-Editor)"):
+        st.caption("Uses secret key automatically if configured. Even without a key, free Telugu ↔ English auto-translation works unlimitedly.")
         secret_key = ""
+        backup_secret = ""
         try:
             if hasattr(st, "secrets"):
                 secret_key = st.secrets.get("GEMINI_API_KEY", "")
+                backup_secret = st.secrets.get("BACKUP_API_KEY", "")
         except Exception:
             pass
-        gemini_key = st.text_input("Gemini API Key (Optional)", value=secret_key, type="password")
+        gemini_key = st.text_input("Gemini API Key", value=secret_key, type="password")
+
+active_keys = [gemini_key]
+if backup_secret and backup_secret != gemini_key:
+    active_keys.append(backup_secret)
 
 # ----------------- MAIN WORKSPACE -----------------
 st.markdown("""
 <div class="top-brand-bar">
     <h1>📰 OJAS — Power of Information (ఓజస్) E-Paper Studio</h1>
-    <p>Broadsheet (iPad / Desktop / A4 PDF) & 9:16 Mobile E-Paper • 1–2 Photos + Playable Video PDF</p>
+    <p>Auto Telugu ↔ English Translation • AI Single-Page Condenser • 1–2 Photos + Playable Video PDF</p>
 </div>
 """, unsafe_allow_html=True)
 
 col_editor, col_preview = st.columns([0.95, 1.35], gap="large")
 
 with col_editor:
-    st.subheader("✍️ 1. News Content, Photos & Video")
+    st.subheader("✍️ 1. Smart Bilingual News Desk")
 
-    if gemini_key and HAS_GENAI:
-        with st.expander("🤖 Quick AI Bilingual Translator & Editor", expanded=False):
-            raw_story = st.text_area(
-                "Enter rough news notes (in English, Telugu, or Tanglish):",
-                placeholder="Example: Today MLA inaugurated new CC road in Kodad town, many locals attended...",
-                height=90
-            )
-            if st.button("⚡ Auto-Fill Telugu & English Columns", use_container_width=True):
-                if raw_story.strip():
-                    with st.spinner("Drafting bilingual newspaper report..."):
-                        try:
-                            res_json = ai_bilingual_assist(gemini_key, raw_story, edition_name)
-                            for key in defaults.keys():
-                                if key in res_json:
-                                    st.session_state[key] = res_json[key]
-                            st.success("✅ Bilingual news populated! Review below.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"AI Error: {e}")
-
+    # Quick Tanglish-to-Telugu Converter
     with st.expander("🔤 Type English Phonetics ➔ Instant Telugu (100% Free)", expanded=False):
         phonetic_in = st.text_input(
             "Type Telugu in English letters:",
@@ -331,9 +459,44 @@ with col_editor:
             if phonetic_in.strip():
                 st.code(transliterate_to_telugu(phonetic_in), language=None)
 
+    # ONE-BOX AUTO-TRANSLATE & SINGLE-PAGE CONDENSER
+    st.markdown("##### ⚡ Paste News in Telugu OR English (Auto-Translates Both & Fits 1 Page)")
+    raw_news_input = st.text_area(
+        "Paste raw report in Telugu or English:",
+        value=st.session_state["raw_bilingual_input"],
+        height=135,
+        placeholder="Paste long or short news in Telugu OR English here. Clicking below automatically translates into the other language, removes fluff, and condenses to fit cleanly on 1 single page..."
+    )
+
+    is_9_16 = "9:16" in aspect_preset
+    # Calculate tight word budgets based on selected page format
+    target_te_words = 75 if is_9_16 else 115
+    target_en_words = 85 if is_9_16 else 130
+
+    if st.button("⚡ Auto-Translate (Telugu ↔ English) & Fit to Single Page", type="primary", use_container_width=True):
+        if not raw_news_input.strip():
+            st.warning("Please enter or paste your news text in Telugu or English first.")
+        else:
+            st.session_state["raw_bilingual_input"] = raw_news_input
+            with st.spinner("Applying newsroom editing, two-way translation & single-page fit..."):
+                result = process_bilingual_auto_fit(
+                    active_keys,
+                    raw_news_input,
+                    edition_name,
+                    target_te_words,
+                    target_en_words,
+                    editorial_style
+                )
+                for k in ["te_headline", "te_subhead", "te_body", "en_headline", "en_subhead", "en_body"]:
+                    if k in result:
+                        st.session_state[k] = result[k]
+                st.success("✅ Translated & condensed to fit 1 single page!")
+                st.rerun()
+
+    st.write("")
     tab_te, tab_en, tab_photos, tab_video = st.tabs([
-        "తెలుగు వార్త",
-        "🇬🇧 English News",
+        "తెలుగు (Edit)",
+        "🇬🇧 English (Edit)",
         "📸 Photos (Max 2)",
         "🎬 Video"
     ])
@@ -350,7 +513,7 @@ with col_editor:
         st.session_state["te_body"] = st.text_area(
             "తెలుగు వార్తా వివరాలు (Telugu News Body)",
             value=st.session_state["te_body"],
-            height=210
+            height=165
         )
 
     with tab_en:
@@ -365,7 +528,7 @@ with col_editor:
         st.session_state["en_body"] = st.text_area(
             "English News Body",
             value=st.session_state["en_body"],
-            height=210
+            height=165
         )
 
     with tab_photos:
@@ -418,7 +581,7 @@ with col_editor:
         )
         video_caption = st.text_input(
             "Video News Strip Label",
-            value="వీడియో కథనం చూడటానికి ఇక్కడ క్లిక్ చేయండి • TAP TO WATCH FULL VIDEO REPORT"
+            value="వీడియో కథనం చూడటానికి ఇక్కడ క్లిక్ చేయండి • TAP TO WATCH VIDEO"
         )
 
         video_thumb_b64 = ""
@@ -439,213 +602,176 @@ with col_editor:
         value="OJAS DIGITAL NEWS NETWORK • POWER OF INFORMATION"
     )
 
-# ----------------- CANVAS GEOMETRY & ASPECT RATIO CONFIGURATION -----------------
-is_9_16_fixed = "9:16 Vertical E-Paper" in aspect_preset
-is_9_16_tall = "9:16 Tall Broadsheet" in aspect_preset
+# ----------------- COMPACT SINGLE-PAGE GEOMETRY & TYPOGRAPHY -----------------
+has_video_section = bool(uploaded_video is not None or video_play_url.strip() or video_thumb_b64)
 
-if is_9_16_fixed:
-    # Exact 9:16 Mobile / WhatsApp Status Canvas (720 x 1280 master -> exports at 1440 x 2560 HD)
+if is_9_16:
+    # Exact 9:16 Single-Page Mobile / WhatsApp Status Canvas (720 x 1280 master -> 1440 x 2560 HD)
     sheet_width_px = 720
-    sheet_min_height_css = "height: 1280px; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between;"
-    logo_max_h = "105px"
-    photo_single_h = "260px"
-    photo_dual_h = "195px"
-    te_head_size = "24px"
-    en_head_size = "21px"
-    te_body_size = "15px"
-    en_body_size = "14px"
-    pdf_format_js = "[144, 256]"  # Exact 9:16 mm page in PDF!
-elif is_9_16_tall:
-    # 9:16 Minimum Aspect Ratio (760px wide, min-height 1351px, grows cleanly with long articles)
-    sheet_width_px = 760
-    sheet_min_height_css = "min-height: 1351px; display: flex; flex-direction: column; justify-content: space-between;"
-    logo_max_h = "115px"
-    photo_single_h = "300px"
-    photo_dual_h = "220px"
-    te_head_size = "26px"
-    en_head_size = "22px"
-    te_body_size = "15.5px"
-    en_body_size = "14.5px"
-    pdf_format_js = '"a4"'
+    sheet_height_css = "height: 1280px; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between;"
+    logo_max_h = "86px"
+    photo_single_h = "215px" if not has_video_section else "170px"
+    photo_dual_h = "165px" if not has_video_section else "135px"
+    video_thumb_h = "155px"
+    te_head_size = "21px"
+    en_head_size = "18.5px"
+    te_body_size = "13.8px"
+    en_body_size = "13px"
+    pdf_format_js = "[144, 256]"
 else:
-    # Broadsheet E-Paper (980px wide — Authentic Newspaper Proportion for iPad, Computer & A4 PDF)
+    # Exact A4 Proportion Single-Page Broadsheet (980 x 1386 master -> 1960 x 2772 HD)
     sheet_width_px = 980
-    sheet_min_height_css = "min-height: 1120px; display: flex; flex-direction: column; justify-content: space-between;"
-    logo_max_h = "132px"
-    photo_single_h = "340px"
-    photo_dual_h = "245px"
-    te_head_size = "28px"
-    en_head_size = "24px"
-    te_body_size = "16px"
-    en_body_size = "14.8px"
+    sheet_height_css = "height: 1386px; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between;"
+    logo_max_h = "112px"
+    photo_single_h = "290px" if not has_video_section else "220px"
+    photo_dual_h = "215px" if not has_video_section else "170px"
+    video_thumb_h = "185px"
+    te_head_size = "26px"
+    en_head_size = "22.5px"
+    te_body_size = "15.2px"
+    en_body_size = "14.2px"
     pdf_format_js = '"a4"'
 
 bg_paper = "#ffffff" if paper_theme == "Classic Crisp White" else "#fdfbf7"
 
 logo_html = (
-    f'<img src="data:image/png;base64,{logo_b64}" style="max-height: {logo_max_h}; max-width: 88%; object-fit: contain; display: block; margin: 0 auto;">'
+    f'<img src="data:image/png;base64,{logo_b64}" style="max-height: {logo_max_h}; max-width: 86%; object-fit: contain; display: block; margin: 0 auto;">'
     if logo_b64 else
-    '<div style="font-size:48px; font-weight:900; color:#991b1b; letter-spacing:2px;">OJAS</div><div style="font-size:14px; font-weight:700;">POWER OF INFORMATION • ఓజస్</div>'
+    '<div style="font-size:42px; font-weight:900; color:#991b1b; letter-spacing:2px;">OJAS</div><div style="font-size:12px; font-weight:700;">POWER OF INFORMATION • ఓజస్</div>'
 )
 
-# Photo Grid HTML (1 or 2 photos)
+# Photo Grid HTML (Compact Spacing)
 photos_html = ""
 if len(photo_b64_list) == 1:
     photos_html = f"""
-    <div style="margin: 12px 0 14px 0; border: 1.5px solid #cbd5e1; padding: 6px; background: #fff;">
+    <div style="margin: 6px 0 8px 0; border: 1.5px solid #cbd5e1; padding: 4px; background: #fff;">
         <img src="data:image/jpeg;base64,{photo_b64_list[0]}" style="width: 100%; height: {photo_single_h}; object-fit: cover; display: block;">
-        <div style="font-size: 12.5px; color: #334155; padding: 6px 4px 2px 4px; font-weight: 700; border-top: 1px solid #e2e8f0; margin-top: 5px;">
+        <div style="font-size: 11.5px; color: #334155; padding: 3px 2px 0 2px; font-weight: 700;">
             ▲ {captions[0]}
         </div>
     </div>
     """
 elif len(photo_b64_list) >= 2:
     photos_html = f"""
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 12px 0 14px 0;">
-        <div style="border: 1.5px solid #cbd5e1; padding: 6px; background: #fff;">
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 6px 0 8px 0;">
+        <div style="border: 1.5px solid #cbd5e1; padding: 4px; background: #fff;">
             <img src="data:image/jpeg;base64,{photo_b64_list[0]}" style="width: 100%; height: {photo_dual_h}; object-fit: cover; display: block;">
-            <div style="font-size: 12px; color: #334155; padding-top: 5px; font-weight: 700; line-height: 1.35;">▲ {captions[0]}</div>
+            <div style="font-size: 11px; color: #334155; padding-top: 3px; font-weight: 700; line-height: 1.25;">▲ {captions[0]}</div>
         </div>
-        <div style="border: 1.5px solid #cbd5e1; padding: 6px; background: #fff;">
+        <div style="border: 1.5px solid #cbd5e1; padding: 4px; background: #fff;">
             <img src="data:image/jpeg;base64,{photo_b64_list[1]}" style="width: 100%; height: {photo_dual_h}; object-fit: cover; display: block;">
-            <div style="font-size: 12px; color: #334155; padding-top: 5px; font-weight: 700; line-height: 1.35;">▲ {captions[1]}</div>
+            <div style="font-size: 11px; color: #334155; padding-top: 3px; font-weight: 700; line-height: 1.25;">▲ {captions[1]}</div>
         </div>
     </div>
     """
 
-# Video Box HTML
-has_video_section = bool(uploaded_video is not None or video_play_url.strip() or video_thumb_b64)
+# Video Box HTML (Compact Single-Page Proportions)
 qr_b64 = generate_qr_base64(video_play_url) if video_play_url.strip() else ""
-
 video_box_html = ""
 if has_video_section:
     thumb_visual = (
-        f'<img src="data:image/jpeg;base64,{video_thumb_b64}" style="width:100%; height:230px; object-fit:cover; display:block; filter: brightness(0.84);">'
+        f'<img src="data:image/jpeg;base64,{video_thumb_b64}" style="width:100%; height:{video_thumb_h}; object-fit:cover; display:block; filter: brightness(0.84);">'
         if video_thumb_b64 else
-        '<div style="width:100%; height:150px; background: linear-gradient(135deg, #0f172a 0%, #991b1b 100%);"></div>'
+        '<div style="width:100%; height:110px; background: linear-gradient(135deg, #0f172a 0%, #991b1b 100%);"></div>'
     )
     qr_html = (
-        f'<div style="background:#fff; padding:4px; border-radius:6px; text-align:center; border:1px solid #cbd5e1; flex-shrink:0;">'
-        f'<img src="data:image/png;base64,{qr_b64}" style="width:62px; height:62px; display:block;">'
-        f'<div style="font-size:8.5px; font-weight:800; color:#0f172a; margin-top:2px;">SCAN TO PLAY</div></div>'
+        f'<div style="background:#fff; padding:3px; border-radius:5px; text-align:center; border:1px solid #cbd5e1; flex-shrink:0;">'
+        f'<img src="data:image/png;base64,{qr_b64}" style="width:48px; height:48px; display:block;">'
+        f'<div style="font-size:7.5px; font-weight:800; color:#0f172a; margin-top:1px;">SCAN</div></div>'
         if qr_b64 else ""
     )
     clean_url_display = video_play_url.strip() if video_play_url.strip() else "Attached Digital Video Clip • OJAS E-Paper"
 
     video_box_html = f"""
-    <div id="video-hotspot" style="margin: 12px 0 14px 0; border: 2px solid #991b1b; background: #0f172a; border-radius: 6px; overflow: hidden; position: relative;">
+    <div id="video-hotspot" style="margin: 6px 0 8px 0; border: 2px solid #991b1b; background: #0f172a; border-radius: 5px; overflow: hidden; position: relative;">
         <div style="position: relative; width: 100%;">
             {thumb_visual}
-            <div style="position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(0,0,0,0.26);">
-                <div style="width: 62px; height: 62px; border-radius: 50%; background: rgba(220, 38, 38, 0.95); border: 3px solid #ffffff; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 18px rgba(0,0,0,0.45);">
-                    <div style="width: 0; height: 0; border-top: 12px solid transparent; border-bottom: 12px solid transparent; border-left: 20px solid #ffffff; margin-left: 4px;"></div>
+            <div style="position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(0,0,0,0.24);">
+                <div style="width: 48px; height: 48px; border-radius: 50%; background: rgba(220, 38, 38, 0.95); border: 2.5px solid #ffffff; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 14px rgba(0,0,0,0.45);">
+                    <div style="width: 0; height: 0; border-top: 9px solid transparent; border-bottom: 9px solid transparent; border-left: 16px solid #ffffff; margin-left: 3px;"></div>
                 </div>
-                <div style="margin-top: 9px; background: rgba(15, 23, 42, 0.9); color: #fef3c7; font-size: 12px; font-weight: 800; padding: 5px 14px; border-radius: 20px; border: 1px solid #f59e0b; letter-spacing: 0.4px;">
+                <div style="margin-top: 6px; background: rgba(15, 23, 42, 0.9); color: #fef3c7; font-size: 11px; font-weight: 800; padding: 3px 11px; border-radius: 16px; border: 1px solid #f59e0b;">
                     ▶ {video_caption}
                 </div>
             </div>
         </div>
-        <div style="background: #fffbeb; padding: 8px 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px; border-top: 1.5px solid #991b1b;">
+        <div style="background: #fffbeb; padding: 5px 10px; display: flex; justify-content: space-between; align-items: center; gap: 8px; border-top: 1.5px solid #991b1b;">
             <div style="flex: 1;">
-                <div style="font-size: 11px; font-weight: 800; color: #991b1b; text-transform: uppercase;">🎬 OJAS MULTIMEDIA VIDEO BULLETIN</div>
-                <div style="font-size: 12px; color: #1e293b; font-weight: 600; word-break: break-all;">{clean_url_display}</div>
+                <div style="font-size: 10px; font-weight: 800; color: #991b1b;">🎬 OJAS MULTIMEDIA VIDEO</div>
+                <div style="font-size: 11px; color: #1e293b; font-weight: 600; word-break: break-all;">{clean_url_display}</div>
             </div>
             {qr_html}
         </div>
     </div>
     """
 
-te_body_formatted = st.session_state["te_body"].replace("\n", "<br><br>")
-en_body_formatted = st.session_state["en_body"].replace("\n", "<br><br>")
+# Remove extra blank lines so text stays crisp & compact on a single page
+te_clean_lines = [line.strip() for line in st.session_state["te_body"].split("\n") if line.strip()]
+en_clean_lines = [line.strip() for line in st.session_state["en_body"].split("\n") if line.strip()]
+te_body_formatted = "<br>".join(te_clean_lines)
+en_body_formatted = "<br>".join(en_clean_lines)
 
-te_sub_html = f'<div style="font-size: 15.5px; font-weight: 700; color: #991b1b; margin-bottom: 10px; line-height: 1.45;">◆ {st.session_state["te_subhead"]}</div>' if st.session_state["te_subhead"].strip() else ""
-en_sub_html = f'<div style="font-size: 14.5px; font-weight: 700; color: #b45309; margin-bottom: 10px; line-height: 1.45;">◆ {st.session_state["en_subhead"]}</div>' if st.session_state["en_subhead"].strip() else ""
+te_sub_html = f'<div style="font-size: 13.5px; font-weight: 700; color: #991b1b; margin-bottom: 5px; line-height: 1.3;">◆ {st.session_state["te_subhead"]}</div>' if st.session_state["te_subhead"].strip() else ""
+en_sub_html = f'<div style="font-size: 12.8px; font-weight: 700; color: #b45309; margin-bottom: 5px; line-height: 1.3;">◆ {st.session_state["en_subhead"]}</div>' if st.session_state["en_subhead"].strip() else ""
 
-# Newspaper Column Layouts (Broadsheet Multi-Column vs 9:16 Stacked Vertical Flow)
-if is_9_16_fixed and layout_mode == "Bilingual Side-by-Side (Telugu + English)":
-    # On narrow 9:16 mobile view, balanced 2-column grid with crisp readable sizing
+if layout_mode == "Bilingual Side-by-Side (Telugu + English)":
     news_columns_html = f"""
-    <div style="display: grid; grid-template-columns: 1.08fr 1fr; gap: 18px; margin-top: 10px; flex: 1;">
-        <div style="border-right: 1.5px solid #cbd5e1; padding-right: 16px;">
-            <div style="display:inline-block; background:#991b1b; color:#fff; font-size:11px; font-weight:800; padding:2px 9px; border-radius:3px; margin-bottom:7px;">తెలుగు</div>
-            <h2 style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_head_size}; font-weight: 800; color: #0f172a; line-height: 1.32; margin: 0 0 7px 0;">
+    <div style="display: grid; grid-template-columns: 1.08fr 1fr; gap: 16px; margin-top: 6px;">
+        <div style="border-right: 1.5px solid #cbd5e1; padding-right: 14px;">
+            <div style="display:inline-block; background:#991b1b; color:#fff; font-size:9.5px; font-weight:800; padding:1.5px 7px; border-radius:2px; margin-bottom:4px;">తెలుగు</div>
+            <h2 style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_head_size}; font-weight: 800; color: #0f172a; line-height: 1.24; margin: 0 0 4px 0;">
                 {st.session_state["te_headline"]}
             </h2>
             {te_sub_html}
-            <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_body_size}; line-height: 1.72; color: #1e293b; text-align: justify;">
+            <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_body_size}; line-height: 1.52; color: #1e293b; text-align: justify;">
                 {te_body_formatted}
             </div>
         </div>
         <div>
-            <div style="display:inline-block; background:#1e293b; color:#fff; font-size:11px; font-weight:800; padding:2px 9px; border-radius:3px; margin-bottom:7px; letter-spacing:0.5px;">ENGLISH</div>
-            <h2 style="font-family: 'Merriweather', Georgia, serif; font-size: {en_head_size}; font-weight: 900; color: #0f172a; line-height: 1.28; margin: 0 0 7px 0;">
+            <div style="display:inline-block; background:#1e293b; color:#fff; font-size:9.5px; font-weight:800; padding:1.5px 7px; border-radius:2px; margin-bottom:4px; letter-spacing:0.4px;">ENGLISH</div>
+            <h2 style="font-family: 'Merriweather', Georgia, serif; font-size: {en_head_size}; font-weight: 900; color: #0f172a; line-height: 1.22; margin: 0 0 4px 0;">
                 {st.session_state["en_headline"]}
             </h2>
             {en_sub_html}
-            <div style="font-family: 'Plus Jakarta Sans', sans-serif; font-size: {en_body_size}; line-height: 1.65; color: #1e293b; text-align: justify;">
-                {en_body_formatted}
-            </div>
-        </div>
-    </div>
-    """
-elif layout_mode == "Bilingual Side-by-Side (Telugu + English)":
-    news_columns_html = f"""
-    <div style="display: grid; grid-template-columns: 1.12fr 1fr; gap: 24px; margin-top: 12px; flex: 1;">
-        <div style="border-right: 1.5px solid #cbd5e1; padding-right: 22px;">
-            <div style="display:inline-block; background:#991b1b; color:#fff; font-size:11px; font-weight:800; padding:3px 10px; border-radius:3px; margin-bottom:8px;">తెలుగు</div>
-            <h2 style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_head_size}; font-weight: 800; color: #0f172a; line-height: 1.32; margin: 0 0 8px 0;">
-                {st.session_state["te_headline"]}
-            </h2>
-            {te_sub_html}
-            <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_body_size}; line-height: 1.76; color: #1e293b; text-align: justify;">
-                {te_body_formatted}
-            </div>
-        </div>
-        <div>
-            <div style="display:inline-block; background:#1e293b; color:#fff; font-size:11px; font-weight:800; padding:3px 10px; border-radius:3px; margin-bottom:8px; letter-spacing:0.5px;">ENGLISH</div>
-            <h2 style="font-family: 'Merriweather', Georgia, serif; font-size: {en_head_size}; font-weight: 900; color: #0f172a; line-height: 1.28; margin: 0 0 8px 0;">
-                {st.session_state["en_headline"]}
-            </h2>
-            {en_sub_html}
-            <div style="font-family: 'Plus Jakarta Sans', sans-serif; font-size: {en_body_size}; line-height: 1.68; color: #1e293b; text-align: justify;">
+            <div style="font-family: 'Plus Jakarta Sans', sans-serif; font-size: {en_body_size}; line-height: 1.46; color: #1e293b; text-align: justify;">
                 {en_body_formatted}
             </div>
         </div>
     </div>
     """
 elif layout_mode == "Telugu Lead + English Box":
-    col_count_te = 2 if sheet_width_px >= 900 else 1
+    col_count_te = 2 if not is_9_16 else 1
     news_columns_html = f"""
-    <div style="margin-top: 10px; flex: 1;">
-        <h2 style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_head_size}; font-weight: 800; color: #0f172a; line-height: 1.32; margin: 0 0 8px 0;">
+    <div style="margin-top: 6px;">
+        <h2 style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_head_size}; font-weight: 800; color: #0f172a; line-height: 1.24; margin: 0 0 4px 0;">
             {st.session_state["te_headline"]}
         </h2>
         {te_sub_html}
-        <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_body_size}; line-height: 1.78; color: #1e293b; text-align: justify; column-count: {col_count_te}; column-gap: 24px; column-rule: 1px solid #cbd5e1;">
+        <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_body_size}; line-height: 1.54; color: #1e293b; text-align: justify; column-count: {col_count_te}; column-gap: 18px; column-rule: 1px solid #cbd5e1;">
             {te_body_formatted}
         </div>
-        <div style="margin-top: 18px; background: #f8fafc; border-left: 5px solid #991b1b; border-top: 1px solid #cbd5e1; border-right: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1; padding: 14px 18px;">
-            <div style="font-size: 11px; font-weight: 800; color: #991b1b; letter-spacing: 1px; margin-bottom: 5px;">ENGLISH SUMMARY</div>
-            <div style="font-family: 'Merriweather', Georgia, serif; font-size: 19px; font-weight: 800; color: #0f172a; margin-bottom: 6px;">{st.session_state["en_headline"]}</div>
-            <div style="font-size: {en_body_size}; line-height: 1.65; color: #334155; text-align: justify;">{en_body_formatted}</div>
+        <div style="margin-top: 10px; background: #f8fafc; border-left: 4px solid #991b1b; border-top: 1px solid #cbd5e1; border-right: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1; padding: 9px 12px;">
+            <div style="font-size: 9.5px; font-weight: 800; color: #991b1b; letter-spacing: 0.8px; margin-bottom: 2px;">ENGLISH EDITION</div>
+            <div style="font-family: 'Merriweather', Georgia, serif; font-size: 16px; font-weight: 800; color: #0f172a; margin-bottom: 3px; line-height: 1.22;">{st.session_state["en_headline"]}</div>
+            <div style="font-size: {en_body_size}; line-height: 1.44; color: #334155; text-align: justify;">{en_body_formatted}</div>
         </div>
     </div>
     """
 else:
-    col_count_en = 2 if sheet_width_px >= 900 else 1
+    col_count_en = 2 if not is_9_16 else 1
     news_columns_html = f"""
-    <div style="margin-top: 10px; flex: 1;">
-        <h2 style="font-family: 'Merriweather', Georgia, serif; font-size: {en_head_size}; font-weight: 900; color: #0f172a; line-height: 1.28; margin: 0 0 8px 0;">
+    <div style="margin-top: 6px;">
+        <h2 style="font-family: 'Merriweather', Georgia, serif; font-size: {en_head_size}; font-weight: 900; color: #0f172a; line-height: 1.22; margin: 0 0 4px 0;">
             {st.session_state["en_headline"]}
         </h2>
         {en_sub_html}
-        <div style="font-size: {en_body_size}; line-height: 1.72; color: #1e293b; text-align: justify; column-count: {col_count_en}; column-gap: 24px; column-rule: 1px solid #cbd5e1;">
+        <div style="font-size: {en_body_size}; line-height: 1.48; color: #1e293b; text-align: justify; column-count: {col_count_en}; column-gap: 18px; column-rule: 1px solid #cbd5e1;">
             {en_body_formatted}
         </div>
-        <div style="margin-top: 18px; background: #fffbeb; border-left: 5px solid #b45309; border-top: 1px solid #fde68a; border-right: 1px solid #fde68a; border-bottom: 1px solid #fde68a; padding: 14px 18px;">
-            <div style="font-size: 12px; font-weight: 800; color: #b45309; margin-bottom: 5px;">తెలుగు సారాంశం</div>
-            <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: 20px; font-weight: 800; color: #0f172a; margin-bottom: 6px;">{st.session_state["te_headline"]}</div>
-            <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_body_size}; line-height: 1.72; color: #334155; text-align: justify;">{te_body_formatted}</div>
+        <div style="margin-top: 10px; background: #fffbeb; border-left: 4px solid #b45309; border-top: 1px solid #fde68a; border-right: 1px solid #fde68a; border-bottom: 1px solid #fde68a; padding: 9px 12px;">
+            <div style="font-size: 10px; font-weight: 800; color: #b45309; margin-bottom: 2px;">తెలుగు సంచిక</div>
+            <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: 17px; font-weight: 800; color: #0f172a; margin-bottom: 3px; line-height: 1.24;">{st.session_state["te_headline"]}</div>
+            <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_body_size}; line-height: 1.5; color: #334155; text-align: justify;">{te_body_formatted}</div>
         </div>
     </div>
     """
@@ -653,9 +779,9 @@ else:
 safe_filename = f"OJAS_News_{pub_date.strftime('%Y%m%d')}"
 escaped_video_url = json.dumps(video_play_url.strip())
 
-# ----------------- RIGHT COLUMN: RESPONSIVE SCALED PREVIEW + FULL-RES JPEG & PDF EXPORT -----------------
+# ----------------- RIGHT COLUMN: SINGLE-PAGE LIVE PREVIEW & HD JPEG / PDF EXPORT -----------------
 with col_preview:
-    st.subheader("🗞️ 2. Live Newspaper Preview & Export")
+    st.subheader("🗞️ 2. Single-Page Newspaper Preview & Export")
 
     newspaper_widget_html = f"""
     <!DOCTYPE html>
@@ -672,7 +798,7 @@ with col_preview:
         }}
         body {{
             margin: 0;
-            padding: 6px;
+            padding: 4px;
             background: transparent;
             font-family: 'Plus Jakarta Sans', 'Noto Sans Telugu', sans-serif;
             overflow-x: hidden;
@@ -680,28 +806,23 @@ with col_preview:
         .toolbar {{
             display: flex;
             gap: 10px;
-            margin-bottom: 10px;
+            margin-bottom: 8px;
             flex-wrap: wrap;
         }}
         .btn {{
             flex: 1;
-            min-width: 155px;
-            padding: 12px 16px;
+            min-width: 150px;
+            padding: 11px 14px;
             border: none;
-            border-radius: 9px;
-            font-size: 14px;
+            border-radius: 8px;
+            font-size: 13.5px;
             font-weight: 700;
             cursor: pointer;
             display: flex;
             align-items: center;
             justify-content: center;
             gap: 6px;
-            transition: transform 0.15s ease, opacity 0.15s ease;
             box-shadow: 0 3px 10px rgba(0,0,0,0.12);
-        }}
-        .btn:hover {{
-            transform: translateY(-1px);
-            opacity: 0.95;
         }}
         .btn-jpg {{
             background: linear-gradient(90deg, #991b1b, #dc2626);
@@ -712,14 +833,13 @@ with col_preview:
             color: #ffffff;
         }}
         #status-msg {{
-            font-size: 12.5px;
+            font-size: 12px;
             font-weight: 700;
             color: #15803d;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
             text-align: center;
-            min-height: 18px;
+            min-height: 16px;
         }}
-        /* Responsive Auto-Fit Wrapper for Phone, iPad & Desktop */
         #preview-viewport {{
             width: 100%;
             overflow: hidden;
@@ -730,50 +850,50 @@ with col_preview:
         #scale-holder {{
             transform-origin: top left;
         }}
-        /* Fixed Master Print Sheet (Prevents thin/squished exports on mobile & iPad) */
+        /* Fixed Single-Page Master Canvas */
         #newspaper-sheet {{
             width: {sheet_width_px}px;
-            {sheet_min_height_css}
+            {sheet_height_css}
             background-color: {bg_paper};
             border: 2.5px solid #1e293b;
-            padding: 24px 28px 18px 28px;
-            box-shadow: 0 10px 28px rgba(0,0,0,0.14);
+            padding: 16px 22px 12px 22px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.14);
             color: #0f172a;
         }}
         .masthead-wrap {{
             text-align: center;
-            padding-bottom: 10px;
+            padding-bottom: 6px;
         }}
         .dateline-bar {{
             display: flex;
             justify-content: space-between;
             align-items: center;
-            border-top: 3px solid #991b1b;
-            border-bottom: 2px solid #1e293b;
-            padding: 7px 6px;
-            font-size: 12.5px;
+            border-top: 2.5px solid #991b1b;
+            border-bottom: 1.5px solid #1e293b;
+            padding: 4px 4px;
+            font-size: 11.5px;
             font-weight: 800;
             color: #1e293b;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 12px;
-            gap: 8px;
+            letter-spacing: 0.4px;
+            margin-bottom: 6px;
+            gap: 6px;
         }}
         .section-pill {{
             background: #991b1b;
             color: #ffffff;
-            padding: 3px 10px;
-            font-size: 11.5px;
+            padding: 2px 9px;
+            font-size: 10.5px;
             font-weight: 800;
             border-radius: 2px;
         }}
         .footer-strip {{
-            margin-top: 20px;
-            padding-top: 9px;
-            border-top: 2.5px solid #991b1b;
+            margin-top: 8px;
+            padding-top: 6px;
+            border-top: 2px solid #991b1b;
             display: flex;
             justify-content: space-between;
-            font-size: 12px;
+            font-size: 11px;
             font-weight: 700;
             color: #475569;
         }}
@@ -781,8 +901,8 @@ with col_preview:
     </head>
     <body>
         <div class="toolbar">
-            <button class="btn btn-jpg" onclick="downloadJPEG()">🖼️ Download HD JPEG</button>
-            <button class="btn btn-pdf" onclick="downloadPDF()">📄 Download Interactive PDF</button>
+            <button class="btn btn-jpg" onclick="downloadJPEG()">🖼️ Download Single-Page HD JPEG</button>
+            <button class="btn btn-pdf" onclick="downloadPDF()">📄 Download Single-Page PDF</button>
         </div>
         <div id="status-msg"></div>
 
@@ -819,7 +939,6 @@ with col_preview:
             const MASTER_WIDTH = {sheet_width_px};
             const VIDEO_URL = {escaped_video_url};
 
-            // Automatically scales the fixed broadsheet/9:16 master canvas to fit Mobile, iPad, or Desktop viewport cleanly
             function fitPreviewToViewport() {{
                 const viewport = document.getElementById('preview-viewport');
                 const holder = document.getElementById('scale-holder');
@@ -832,30 +951,30 @@ with col_preview:
                 holder.style.width = MASTER_WIDTH + 'px';
                 const scaledH = sheet.offsetHeight * scale;
                 holder.style.height = scaledH + 'px';
-                viewport.style.height = (scaledH + 16) + 'px';
+                viewport.style.height = (scaledH + 10) + 'px';
             }}
 
             window.addEventListener('load', () => {{
                 fitPreviewToViewport();
-                setTimeout(fitPreviewToViewport, 400);
+                setTimeout(fitPreviewToViewport, 350);
             }});
             window.addEventListener('resize', fitPreviewToViewport);
 
             async function renderMasterCanvas() {{
                 const status = document.getElementById('status-msg');
-                status.innerText = "⏳ Rendering full-resolution broadsheet edition...";
+                status.innerText = "⏳ Rendering single-page print edition...";
                 await document.fonts.ready;
 
                 const holder = document.getElementById('scale-holder');
                 const prevTransform = holder.style.transform;
-                // Temporarily reset CSS preview scale to 1.0 so html2canvas captures un-scaled full-width HD pixels
                 holder.style.transform = "scale(1)";
 
                 const element = document.getElementById('newspaper-sheet');
                 const canvas = await html2canvas(element, {{
                     scale: 2,
                     width: MASTER_WIDTH,
-                    windowWidth: MASTER_WIDTH + 60,
+                    height: element.offsetHeight,
+                    windowWidth: MASTER_WIDTH + 40,
                     useCORS: true,
                     backgroundColor: "{bg_paper}",
                     logging: false
@@ -873,7 +992,7 @@ with col_preview:
                     link.download = "{safe_filename}.jpg";
                     link.href = canvas.toDataURL("image/jpeg", 0.96);
                     link.click();
-                    document.getElementById('status-msg').innerText = "✅ Full-width HD JPEG downloaded!";
+                    document.getElementById('status-msg').innerText = "✅ Single-page HD JPEG downloaded!";
                 }} catch (err) {{
                     document.getElementById('status-msg').innerText = "⚠️ Error: " + err;
                 }}
@@ -882,7 +1001,6 @@ with col_preview:
             async function downloadPDF() {{
                 try {{
                     const holder = document.getElementById('scale-holder');
-                    const prevTransform = holder.style.transform;
                     holder.style.transform = "scale(1)";
 
                     const sheetEl = document.getElementById('newspaper-sheet');
@@ -894,7 +1012,6 @@ with col_preview:
                     const imgData = canvas.toDataURL("image/jpeg", 0.96);
                     const {{ jsPDF }} = window.jspdf;
 
-                    const isCustom916 = {str(is_9_16_fixed).lower()};
                     const pdf = new jsPDF({{
                         orientation: "portrait",
                         unit: "mm",
@@ -903,52 +1020,24 @@ with col_preview:
 
                     const pageWidth = pdf.internal.pageSize.getWidth();
                     const pageHeight = pdf.internal.pageSize.getHeight();
-                    const margin = isCustom916 ? 0 : 6;
-                    const usableWidth = pageWidth - (margin * 2);
-                    const imgHeight = (canvas.height * usableWidth) / canvas.width;
 
-                    if (isCustom916) {{
-                        pdf.addImage(imgData, "JPEG", 0, 0, pageWidth, pageHeight);
-                        if (videoRect && VIDEO_URL) {{
-                            const scaleX = pageWidth / sheetRect.width;
-                            const scaleY = pageHeight / sheetRect.height;
-                            pdf.link(
-                                (videoRect.left - sheetRect.left) * scaleX,
-                                (videoRect.top - sheetRect.top) * scaleY,
-                                videoRect.width * scaleX,
-                                videoRect.height * scaleY,
-                                {{ url: VIDEO_URL }}
-                            );
-                        }}
-                    }} else {{
-                        // Full-width A4 PDF layout (scales cleanly across 1 or multiple pages without ever becoming a thin strip)
-                        const usablePageHeight = pageHeight - (margin * 2);
-                        let heightLeft = imgHeight;
-                        let position = margin;
+                    // Strict 1-Page Edge-to-Edge Fit
+                    pdf.addImage(imgData, "JPEG", 0, 0, pageWidth, pageHeight);
 
-                        pdf.addImage(imgData, "JPEG", margin, position, usableWidth, imgHeight);
-                        if (videoRect && VIDEO_URL) {{
-                            const scale = usableWidth / sheetRect.width;
-                            pdf.link(
-                                margin + (videoRect.left - sheetRect.left) * scale,
-                                margin + (videoRect.top - sheetRect.top) * scale,
-                                videoRect.width * scale,
-                                videoRect.height * scale,
-                                {{ url: VIDEO_URL }}
-                            );
-                        }}
-                        heightLeft -= usablePageHeight;
-
-                        while (heightLeft > 2) {{
-                            position = heightLeft - imgHeight + margin;
-                            pdf.addPage();
-                            pdf.addImage(imgData, "JPEG", margin, position, usableWidth, imgHeight);
-                            heightLeft -= usablePageHeight;
-                        }}
+                    if (videoRect && VIDEO_URL) {{
+                        const scaleX = pageWidth / sheetRect.width;
+                        const scaleY = pageHeight / sheetRect.height;
+                        pdf.link(
+                            (videoRect.left - sheetRect.left) * scaleX,
+                            (videoRect.top - sheetRect.top) * scaleY,
+                            videoRect.width * scaleX,
+                            videoRect.height * scaleY,
+                            {{ url: VIDEO_URL }}
+                        );
                     }}
 
                     pdf.save("{safe_filename}.pdf");
-                    document.getElementById('status-msg').innerText = "✅ Full-width Print & Video PDF downloaded!";
+                    document.getElementById('status-msg').innerText = "✅ Single-page PDF downloaded!";
                 }} catch (err) {{
                     document.getElementById('status-msg').innerText = "⚠️ Error: " + err;
                 }}
@@ -958,4 +1047,4 @@ with col_preview:
     </html>
     """
 
-    components.html(newspaper_widget_html, height=1260, scrolling=True)
+    components.html(newspaper_widget_html, height=1120, scrolling=False)
