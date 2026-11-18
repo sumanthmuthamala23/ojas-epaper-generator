@@ -19,7 +19,7 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-# Optional Gemini SDK for Chief-Editor AI bilingual translation & condensation
+# Optional Gemini SDK for Chief-Editor AI bilingual translation & newsroom editing
 try:
     from google import genai
     from google.genai import types
@@ -29,16 +29,16 @@ except ImportError:
 
 # ----------------- PAGE CONFIGURATION -----------------
 st.set_page_config(
-    page_title="OJAS - Power of Information | E-Paper Studio",
+    page_title="OJAS - Power of Information | Bilingual E-Paper Studio",
     page_icon="📰",
     layout="wide",
     initial_sidebar_state="auto"
 )
 
-# ----------------- HELPER FUNCTIONS -----------------
-def load_logo_base64() -> str:
-    """Loads OJAS.png from repository root and converts to base64."""
-    for fname in ["OJAS.png", "ojas.png", "OJAS.jpg", "ojas.jpg"]:
+# ----------------- ASSET HELPERS -----------------
+def load_image_base64(candidates: list) -> str:
+    """Loads the first matching image file from the repository root as base64."""
+    for fname in candidates:
         if os.path.exists(fname):
             with open(fname, "rb") as f:
                 return base64.b64encode(f.read()).decode("utf-8")
@@ -90,7 +90,7 @@ def extract_video_thumbnail_b64(video_file) -> str:
     return ""
 
 def generate_qr_base64(url: str) -> str:
-    """Generates a clean QR code image as base64 PNG for playable video links in PDF/print."""
+    """Generates a crisp QR code image as base64 PNG for playable video links in PDF/print."""
     if not url or not url.strip():
         return ""
     try:
@@ -102,6 +102,7 @@ def generate_qr_base64(url: str) -> str:
         pass
     return ""
 
+# ----------------- TEXT & TRANSLATION HELPERS -----------------
 def detect_telugu(text: str) -> bool:
     """Detects whether the input text is predominantly in Telugu script."""
     te_chars = len(re.findall(r'[\u0C00-\u0C7F]', text))
@@ -109,7 +110,7 @@ def detect_telugu(text: str) -> bool:
     return te_chars > en_chars
 
 def free_translate_text(text: str, source_lang: str, target_lang: str) -> str:
-    """Free unlimited fallback translator between Telugu ('te') and English ('en')."""
+    """Fallback translator between Telugu ('te') and English ('en') when no API key is configured."""
     if not text.strip():
         return ""
     try:
@@ -171,6 +172,37 @@ def transliterate_to_telugu(text: str) -> str:
         converted_lines.append(" ".join(out_words))
     return "\n".join(converted_lines)
 
+# ----------------- PROFESSIONAL GEMINI NEWSROOM ENGINE -----------------
+def discover_active_gemini_models(client) -> list:
+    """Discovers active Gemini models on the user's API key and prioritizes latest 3.x / 4.x models."""
+    preferred_order = [
+        "gemini-3.8-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-4-hydrogen",
+        "gemini-4-argon",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+    ]
+    discovered = []
+    try:
+        for m in client.models.list():
+            name = m.name.replace("models/", "")
+            methods = getattr(m, "supported_generation_methods", []) or []
+            if not methods or "generateContent" in methods:
+                discovered.append(name)
+    except Exception:
+        return preferred_order
+
+    ordered = [m for m in preferred_order if m in discovered]
+    for m in discovered:
+        if m not in ordered and ("flash" in m or "hydrogen" in m or "argon" in m) and "tts" not in m and "image" not in m and "live" not in m:
+            ordered.append(m)
+    return ordered if ordered else preferred_order
+
 def ai_editorial_bilingual_engine(
     keys: list,
     raw_input: str,
@@ -178,29 +210,32 @@ def ai_editorial_bilingual_engine(
     target_te_words: int,
     target_en_words: int,
     editorial_style: str
-) -> dict:
+) -> tuple[dict, str]:
     """
-    Chief-Editor AI Newsroom Engine:
-    - Auto-detects Telugu or English input
-    - Translates & transcreates into authentic Telugu (పత్రికా భాష) AND crisp English
-    - Applies Inverted Pyramid editing & word-budget condensation to fit 1 single page cleanly
+    Chief-Editor AI Newsroom Engine using active Gemini 3.8 / 3.5 / 4 models:
+    - Produces authentic Telugu పత్రికా భాష (Eenadu / Sakshi style) AND crisp English print journalism (The Hindu / DC style)
+    - Extracts a high-impact pull-quote / key takeaway highlight box
+    - Applies Inverted Pyramid editing & strict single-page word budgeting
     """
     last_err = None
-    models_pool = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-3.5-flash-lite"]
 
     prompt = f"""
-    You are the Chief News Editor & Copy Desk Director of 'OJAS - Power of Information' (ఓజస్), a premier Telugu-English bilingual daily newspaper.
+    You are the Chief News Editor & Bilingual Copy Desk Director of 'OJAS - Power of Information' (ఓజస్), a premier Telugu-English bilingual daily newspaper in Telangana & Andhra Pradesh.
 
-    TASK:
-    1. Detect the language of the RAW NEWS INPUT below (it may be in Telugu, English, or mixed Tanglish).
-    2. If the input is in Telugu -> retain/refine the Telugu into crisp journalistic Telugu (పత్రికా భాష) AND translate/transcreate it into sharp English newspaper copy.
-    3. If the input is in English -> refine it into sharp English newspaper copy AND translate/transcreate it into authentic journalistic Telugu (పత్రికా భాష).
-    4. SUPERFICIAL & STRUCTURAL NEWS EDITING TECHNIQUES:
-       - Apply the Inverted Pyramid rule (Lead with Who, What, Where, When, Impact in sentence 1).
-       - Cut redundant filler words, passive phrasing, and repetitive greetings so the entire bilingual story fits comfortably on ONE SINGLE PAGE without overflowing.
-       - Editorial Angle: {editorial_style}
-       - Dateline / Place: {location}
-       - STRICT WORD BUDGET: Keep `te_body` around {target_te_words} words (maximum {target_te_words + 15} words) and `en_body` around {target_en_words} words (maximum {target_en_words + 15} words). Use 1 or 2 tight paragraphs with NO blank lines between them.
+    MISSION:
+    Analyze the RAW NEWS INPUT (which may be in Telugu, English, Tanglish, or rough field notes) and produce publication-ready, authentic bilingual newspaper copy.
+
+    PROFESSIONAL JOURNALISTIC & TRANSLATION RULES:
+    1. NEVER do literal word-for-word machine translation. Transcreate like a senior bilingual sub-editor:
+       - **Telugu Copy (`te_headline`, `te_subhead`, `te_body`)**: Use high-register, natural Telugu print journalism (*పత్రికా భాష* — *Eenadu / Sakshi / Namasthe Telangana* style). Start with a proper dateline (e.g., `కోదాడ, న్యూస్‌టుడే:` or `{location}:`). Use authentic reporting verbs (*పేర్కొన్నారు, వెల్లడించారు, స్పష్టం చేశారు, డిమాండ్ చేశారు, ఆదేశించారు, హెచ్చరించారు*). Keep official designations accurate (*ఎమ్మెల్సీ, కలెక్టర్, ఆర్డీవో, తహసీల్దార్, మున్సిపల్ కమిషనర్*).
+       - **English Copy (`en_headline`, `en_subhead`, `en_body`)**: Use crisp, authoritative Indian print journalism (*The Hindu / Deccan Chronicle* style). Start with an uppercase dateline (e.g., `KODAD:`). Use active voice, sharp journalistic verbs, and clear attribution.
+    2. **News Editing Techniques**:
+       - **Inverted Pyramid**: Lead with the core news, decision, or impact in the very first sentence.
+       - **Headline Craft**: Make headlines punchy, active, and specific—never vague.
+       - **Pull-Quote / Key Highlight**: Extract 1 crisp, high-impact takeaway line (`highlight_quote`) in bilingual or lead language for the newspaper callout box.
+       - **Editorial Angle**: {editorial_style}
+       - **Dateline / Bureau**: {location}
+       - **SINGLE-PAGE WORD BUDGET**: Keep `te_body` strictly around {target_te_words} words (max {target_te_words + 12} words) and `en_body` strictly around {target_en_words} words (max {target_en_words + 12} words). Format as 1 or 2 tight paragraphs with NO empty blank lines.
 
     RAW NEWS INPUT:
     {raw_input}
@@ -209,10 +244,11 @@ def ai_editorial_bilingual_engine(
     {{
         "te_headline": "Punchy 5-8 word journalistic Telugu headline",
         "te_subhead": "Crisp 1-line Telugu deck sub-headline",
-        "te_body": "Edited journalistic Telugu body within {target_te_words} words",
+        "te_body": "Authentic journalistic Telugu report within {target_te_words} words",
         "en_headline": "Punchy 6-10 word journalistic English headline",
         "en_subhead": "Crisp 1-line English deck sub-headline",
-        "en_body": "Edited journalistic English body within {target_en_words} words"
+        "en_body": "Authentic journalistic English report within {target_en_words} words",
+        "pull_quote": "1 sharp key takeaway / quote (max 14 words)"
     }}
     """
 
@@ -221,6 +257,7 @@ def ai_editorial_bilingual_engine(
             continue
         try:
             client = genai.Client(api_key=key.strip())
+            models_pool = discover_active_gemini_models(client)
             for m_name in models_pool:
                 try:
                     res = client.models.generate_content(
@@ -232,10 +269,11 @@ def ai_editorial_bilingual_engine(
                         )
                     )
                     if res and res.text:
-                        return json.loads(res.text)
+                        parsed = json.loads(res.text)
+                        return parsed, m_name
                 except Exception as e:
                     last_err = e
-                    time.sleep(0.6)
+                    time.sleep(0.4)
                     continue
         except Exception as ce:
             last_err = ce
@@ -252,8 +290,8 @@ def process_bilingual_auto_fit(
     target_te_words: int,
     target_en_words: int,
     editorial_style: str
-) -> dict:
-    """Runs AI Chief Editor if API key is present; otherwise runs free two-way translation + smart single-page condenser."""
+) -> tuple[dict, str]:
+    """Runs Gemini Chief-Editor AI if API key is available; otherwise uses free two-way translation fallback."""
     valid_keys = [k for k in keys if k and k.strip()]
     if valid_keys and HAS_GENAI:
         try:
@@ -261,7 +299,7 @@ def process_bilingual_auto_fit(
                 valid_keys, raw_text, location, target_te_words, target_en_words, editorial_style
             )
         except Exception as e:
-            st.warning(f"AI key busy ({e}) — switching to instant free bilingual translator & condenser.")
+            st.warning(f"Gemini API notice ({e}) — using free instant translation fallback.")
 
     # Free Unlimited Fallback (Zero API Key Needed)
     is_te = detect_telugu(raw_text)
@@ -289,54 +327,76 @@ def process_bilingual_auto_fit(
         "en_headline": en_head,
         "en_subhead": "",
         "en_body": en_body,
-    }
+        "pull_quote": ""
+    }, "Free Fallback Translator"
 
 # ----------------- CUSTOM RESPONSIVE APP STYLING -----------------
-st.markdown("""
+bg_b64 = load_image_base64(["background.png"])
+dev_b64 = load_image_base64(["Sumanth.jpg", "sumanth.jpg"])
+
+app_bg_css = (
+    f"""
+    .stApp {{
+        background: linear-gradient(rgba(248, 250, 252, 0.94), rgba(241, 245, 249, 0.96)),
+                    url("data:image/png;base64,{bg_b64}");
+        background-size: cover;
+        background-attachment: fixed;
+    }}
+    """
+    if bg_b64 else
+    """
+    .stApp {
+        background: linear-gradient(180deg, #f8fafc 0%, #eef2f6 100%);
+    }
+    """
+)
+
+st.markdown(f"""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Telugu:wght@400;600;700;800&family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap');
 
-    .stApp {
-        background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
-    }
-    html, body, p, div:not([data-testid="stIconMaterial"]), input, textarea, button {
+    {app_bg_css}
+
+    html, body, p, div:not([data-testid="stIconMaterial"]), input, textarea, button {{
         font-family: 'Plus Jakarta Sans', 'Noto Sans Telugu', sans-serif !important;
-    }
-    span[data-testid="stIconMaterial"], .material-symbols-rounded {
+    }}
+    span[data-testid="stIconMaterial"], .material-symbols-rounded {{
         font-family: 'Material Symbols Rounded' !important;
-    }
-    .top-brand-bar {
-        background: linear-gradient(90deg, #991b1b 0%, #b91c1c 60%, #d97706 100%);
+    }}
+    .top-brand-bar {{
+        background: linear-gradient(90deg, #7f1d1d 0%, #b91c1c 58%, #d97706 100%);
         color: white;
-        padding: 14px 22px;
-        border-radius: 12px;
+        padding: 15px 24px;
+        border-radius: 14px;
         margin-bottom: 16px;
-        box-shadow: 0 6px 18px rgba(153, 27, 27, 0.2);
-    }
-    .top-brand-bar h1 {
+        box-shadow: 0 8px 22px rgba(127, 29, 29, 0.22);
+        border: 1px solid rgba(255,255,255,0.18);
+    }}
+    .top-brand-bar h1 {{
         color: white !important;
         margin: 0 !important;
         font-size: 21px !important;
         font-weight: 800 !important;
-    }
-    .top-brand-bar p {
+    }}
+    .top-brand-bar p {{
         color: #fef3c7 !important;
         margin: 3px 0 0 0 !important;
         font-size: 13px !important;
-    }
-    div.stButton > button[kind="primary"] {
+    }}
+    div.stButton > button[kind="primary"] {{
         background: linear-gradient(90deg, #991b1b 0%, #dc2626 100%) !important;
         color: white !important;
         font-weight: 700 !important;
         border-radius: 10px !important;
         border: none !important;
-        padding: 10px 20px !important;
-    }
-    @media screen and (max-width: 768px) {
-        .top-brand-bar { padding: 11px 14px !important; }
-        .top-brand-bar h1 { font-size: 17px !important; }
-        .block-container { padding-left: 0.65rem !important; padding-right: 0.65rem !important; }
-    }
+        padding: 11px 20px !important;
+        box-shadow: 0 4px 12px rgba(185, 28, 28, 0.25) !important;
+    }}
+    @media screen and (max-width: 768px) {{
+        .top-brand-bar {{ padding: 11px 14px !important; }}
+        .top-brand-bar h1 {{ font-size: 17px !important; }}
+        .block-container {{ padding-left: 0.65rem !important; padding-right: 0.65rem !important; }}
+    }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -344,11 +404,13 @@ st.markdown("""
 defaults = {
     "te_headline": "ప్రజా సమస్యల పరిష్కారమే లక్ష్యంగా ప్రత్యేక కార్యాచరణ",
     "te_subhead": "అధికారులు క్షేత్రస్థాయిలో పర్యటించి తక్షణ చర్యలు చేపట్టాలి",
-    "te_body": "కోదాడ, న్యూస్‌టుడే: పట్టణ, గ్రామీణ ప్రాంతాల్లో ప్రజలు ఎదుర్కొంటున్న మౌలిక వసతుల సమస్యలను యుద్ధప్రాతిపదికన పరిష్కరించేందుకు ప్రత్యేక ప్రణాళిక సిద్ధం చేసినట్లు అధికారులు వెల్లడించారు. తాగునీరు, రహదారులు, పారిశుద్ధ్య పనులపై ప్రత్యేక దృష్టి సారించి గడువులోగా పూర్తి చేయాలని ఆదేశించారు.",
+    "te_body": "కోదాడ, న్యూస్‌టుడే: పట్టణ, గ్రామీణ ప్రాంతాల్లో ప్రజలు ఎదుర్కొంటున్న మౌలిక వసతుల సమస్యలను యుద్ధప్రాతిపదికన పరిష్కరించేందుకు ప్రత్యేక ప్రణాళిక సిద్ధం చేసినట్లు అధికారులు వెల్లడించారు. తాగునీరు, రహదారులు, పారిశుద్ధ్య పనులపై ప్రత్యేక దృష్టి సారించి నిర్ణీత గడువులోగా పూర్తి చేయాలని ఆదేశించారు.",
     "en_headline": "Special Action Plan Launched to Resolve Public Grievances",
     "en_subhead": "Officials directed to conduct field visits and ensure swift redressal",
     "en_body": "KODAD: Authorities have rolled out a dedicated action plan to resolve civic and infrastructure issues across urban and rural pockets on a war footing. Officials have been instructed to prioritize drinking water supply, road repairs, and sanitation works with strict timelines.",
-    "raw_bilingual_input": ""
+    "pull_quote": "ప్రజా సమస్యల పరిష్కారంలో అలసత్వం వహిస్తే కఠిన చర్యలు తప్పవు • Zero tolerance for delay in civic works",
+    "raw_bilingual_input": "",
+    "last_engine_used": ""
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -356,7 +418,7 @@ for k, v in defaults.items():
 
 # ----------------- SIDEBAR: EDITION & VIEWPORT SETTINGS -----------------
 with st.sidebar:
-    logo_b64 = load_logo_base64()
+    logo_b64 = load_image_base64(["OJAS.png", "ojas.png", "OJAS.jpg", "ojas.jpg"])
     if logo_b64:
         st.markdown(
             f'<div style="background:#fff; padding:8px; border-radius:10px; border:1px solid #e2e8f0; text-align:center; margin-bottom:10px;">'
@@ -377,11 +439,11 @@ with st.sidebar:
     )
 
     editorial_style = st.selectbox(
-        "🧠 AI News Editing Technique",
+        "🧠 AI Newsroom Editing Style",
         [
+            "Print Daily Standard • Eenadu / Sakshi & The Hindu Style",
             "Inverted Pyramid • Crisp Breaking News",
-            "Print Daily Standard • Eenadu / Sakshi Style",
-            "Official Statement • Authoritative Press Tone",
+            "Official Statement • Authoritative Press Release",
             "Civic & Welfare Spotlight • Human-Interest Lead"
         ]
     )
@@ -415,13 +477,17 @@ with st.sidebar:
     )
 
     paper_theme = st.selectbox(
-        "Paper Tone",
-        ["Classic Crisp White", "Warm Editorial Newsprint"]
+        "Paper Graphic Theme",
+        [
+            "Classic Editorial Newsprint (Warm Ivory & Crimson)",
+            "Royal Broadsheet White (Crisp White & Maroon)",
+            "Sunday Magazine Edition (Cream & Gold Accent)"
+        ]
     )
 
     st.divider()
-    with st.expander("🔑 Gemini API Key (Optional for AI Copy-Editor)"):
-        st.caption("Uses secret key automatically if configured. Even without a key, free Telugu ↔ English auto-translation works unlimitedly.")
+    with st.expander("🔑 Gemini AI Key (For Chief-Editor Newsroom Translation)", expanded=True):
+        st.caption("Connects directly to Gemini 3.8 / 3.5 Flash for authentic Telugu (పత్రికా భాష) & English newsroom translation.")
         secret_key = ""
         backup_secret = ""
         try:
@@ -431,6 +497,16 @@ with st.sidebar:
         except Exception:
             pass
         gemini_key = st.text_input("Gemini API Key", value=secret_key, type="password")
+        if st.session_state["last_engine_used"]:
+            st.caption(f"⚡ Active Engine: `{st.session_state['last_engine_used']}`")
+
+    if dev_b64:
+        st.markdown(
+            f'<div style="display:flex; align-items:center; gap:10px; background:#fff; padding:8px 10px; border-radius:10px; border:1px solid #e2e8f0; margin-top:10px;">'
+            f'<img src="data:image/jpeg;base64,{dev_b64}" style="width:40px; height:40px; border-radius:50%; object-fit:cover; border:2px solid #991b1b;">'
+            f'<div style="font-size:11.5px; font-weight:700; color:#1e293b; line-height:1.25;">OJAS Digital Studio<br><span style="color:#991b1b; font-size:10.5px;">By Sumanth Muthamala</span></div></div>',
+            unsafe_allow_html=True
+        )
 
 active_keys = [gemini_key]
 if backup_secret and backup_secret != gemini_key:
@@ -440,7 +516,7 @@ if backup_secret and backup_secret != gemini_key:
 st.markdown("""
 <div class="top-brand-bar">
     <h1>📰 OJAS — Power of Information (ఓజస్) E-Paper Studio</h1>
-    <p>Auto Telugu ↔ English Translation • AI Single-Page Condenser • 1–2 Photos + Playable Video PDF</p>
+    <p>Gemini AI Newsroom Translation (Telugu ↔ English) • Single-Page Broadsheet & 9:16 Mobile • 1–2 Photos + Video PDF</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -449,7 +525,6 @@ col_editor, col_preview = st.columns([0.95, 1.35], gap="large")
 with col_editor:
     st.subheader("✍️ 1. Smart Bilingual News Desk")
 
-    # Quick Tanglish-to-Telugu Converter
     with st.expander("🔤 Type English Phonetics ➔ Instant Telugu (100% Free)", expanded=False):
         phonetic_in = st.text_input(
             "Type Telugu in English letters:",
@@ -459,27 +534,25 @@ with col_editor:
             if phonetic_in.strip():
                 st.code(transliterate_to_telugu(phonetic_in), language=None)
 
-    # ONE-BOX AUTO-TRANSLATE & SINGLE-PAGE CONDENSER
-    st.markdown("##### ⚡ Paste News in Telugu OR English (Auto-Translates Both & Fits 1 Page)")
+    st.markdown("##### ⚡ Paste News in Telugu OR English (AI Newsroom Auto-Translate & 1-Page Fit)")
     raw_news_input = st.text_area(
-        "Paste raw report in Telugu or English:",
+        "Paste raw report, press note, or field details in Telugu or English:",
         value=st.session_state["raw_bilingual_input"],
         height=135,
-        placeholder="Paste long or short news in Telugu OR English here. Clicking below automatically translates into the other language, removes fluff, and condenses to fit cleanly on 1 single page..."
+        placeholder="Paste news in Telugu OR English here. Gemini AI will translate it using authentic newspaper terminology, craft punchy headlines + highlight quote, and condense it to fit cleanly on 1 single page..."
     )
 
     is_9_16 = "9:16" in aspect_preset
-    # Calculate tight word budgets based on selected page format
-    target_te_words = 75 if is_9_16 else 115
-    target_en_words = 85 if is_9_16 else 130
+    target_te_words = 72 if is_9_16 else 112
+    target_en_words = 82 if is_9_16 else 126
 
-    if st.button("⚡ Auto-Translate (Telugu ↔ English) & Fit to Single Page", type="primary", use_container_width=True):
+    if st.button("⚡ AI Newsroom Translate (Telugu ↔ English) & Fit 1 Page", type="primary", use_container_width=True):
         if not raw_news_input.strip():
             st.warning("Please enter or paste your news text in Telugu or English first.")
         else:
             st.session_state["raw_bilingual_input"] = raw_news_input
-            with st.spinner("Applying newsroom editing, two-way translation & single-page fit..."):
-                result = process_bilingual_auto_fit(
+            with st.spinner("Chief Editor AI is translating & formatting your bilingual newspaper edition..."):
+                result, used_engine = process_bilingual_auto_fit(
                     active_keys,
                     raw_news_input,
                     edition_name,
@@ -487,10 +560,11 @@ with col_editor:
                     target_en_words,
                     editorial_style
                 )
-                for k in ["te_headline", "te_subhead", "te_body", "en_headline", "en_subhead", "en_body"]:
+                st.session_state["last_engine_used"] = used_engine
+                for k in ["te_headline", "te_subhead", "te_body", "en_headline", "en_subhead", "en_body", "pull_quote"]:
                     if k in result:
                         st.session_state[k] = result[k]
-                st.success("✅ Translated & condensed to fit 1 single page!")
+                st.success(f"✅ Translated & edited via {used_engine} to fit 1 single page!")
                 st.rerun()
 
     st.write("")
@@ -513,7 +587,11 @@ with col_editor:
         st.session_state["te_body"] = st.text_area(
             "తెలుగు వార్తా వివరాలు (Telugu News Body)",
             value=st.session_state["te_body"],
-            height=165
+            height=155
+        )
+        st.session_state["pull_quote"] = st.text_input(
+            "💎 ముఖ్యాంశం / Quote Ribbon (Optional Highlight Box)",
+            value=st.session_state["pull_quote"]
         )
 
     with tab_en:
@@ -528,7 +606,7 @@ with col_editor:
         st.session_state["en_body"] = st.text_area(
             "English News Body",
             value=st.session_state["en_body"],
-            height=165
+            height=155
         )
 
     with tab_photos:
@@ -602,124 +680,172 @@ with col_editor:
         value="OJAS DIGITAL NEWS NETWORK • POWER OF INFORMATION"
     )
 
-# ----------------- COMPACT SINGLE-PAGE GEOMETRY & TYPOGRAPHY -----------------
+# ----------------- PRINT GRAPHICS & THEME PALETTE -----------------
+if "Classic Editorial Newsprint" in paper_theme:
+    bg_paper = "#fcfaf5"
+    card_bg = "#ffffff"
+    accent_primary = "#991b1b"
+    accent_gold = "#b45309"
+    quote_bg = "#fffbeb"
+    quote_border = "#d97706"
+elif "Sunday Magazine" in paper_theme:
+    bg_paper = "#fffdf7"
+    card_bg = "#ffffff"
+    accent_primary = "#7f1d1d"
+    accent_gold = "#ca8a04"
+    quote_bg = "#fef9c3"
+    quote_border = "#ca8a04"
+else:
+    bg_paper = "#ffffff"
+    card_bg = "#f8fafc"
+    accent_primary = "#991b1b"
+    accent_gold = "#b45309"
+    quote_bg = "#fef2f2"
+    quote_border = "#991b1b"
+
 has_video_section = bool(uploaded_video is not None or video_play_url.strip() or video_thumb_b64)
 
 if is_9_16:
-    # Exact 9:16 Single-Page Mobile / WhatsApp Status Canvas (720 x 1280 master -> 1440 x 2560 HD)
     sheet_width_px = 720
     sheet_height_css = "height: 1280px; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between;"
-    logo_max_h = "86px"
-    photo_single_h = "215px" if not has_video_section else "170px"
-    photo_dual_h = "165px" if not has_video_section else "135px"
-    video_thumb_h = "155px"
-    te_head_size = "21px"
-    en_head_size = "18.5px"
-    te_body_size = "13.8px"
-    en_body_size = "13px"
+    logo_max_h = "84px"
+    photo_single_h = "205px" if not has_video_section else "160px"
+    photo_dual_h = "155px" if not has_video_section else "128px"
+    video_thumb_h = "145px"
+    te_head_size = "20.5px"
+    en_head_size = "18px"
+    te_body_size = "13.6px"
+    en_body_size = "12.8px"
     pdf_format_js = "[144, 256]"
 else:
-    # Exact A4 Proportion Single-Page Broadsheet (980 x 1386 master -> 1960 x 2772 HD)
     sheet_width_px = 980
     sheet_height_css = "height: 1386px; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between;"
-    logo_max_h = "112px"
-    photo_single_h = "290px" if not has_video_section else "220px"
-    photo_dual_h = "215px" if not has_video_section else "170px"
-    video_thumb_h = "185px"
-    te_head_size = "26px"
-    en_head_size = "22.5px"
-    te_body_size = "15.2px"
-    en_body_size = "14.2px"
+    logo_max_h = "108px"
+    photo_single_h = "275px" if not has_video_section else "210px"
+    photo_dual_h = "205px" if not has_video_section else "162px"
+    video_thumb_h = "175px"
+    te_head_size = "25.5px"
+    en_head_size = "22px"
+    te_body_size = "15px"
+    en_body_size = "14px"
     pdf_format_js = '"a4"'
 
-bg_paper = "#ffffff" if paper_theme == "Classic Crisp White" else "#fdfbf7"
-
 logo_html = (
-    f'<img src="data:image/png;base64,{logo_b64}" style="max-height: {logo_max_h}; max-width: 86%; object-fit: contain; display: block; margin: 0 auto;">'
+    f'<img src="data:image/png;base64,{logo_b64}" style="max-height: {logo_max_h}; max-width: 84%; object-fit: contain; display: block; margin: 0 auto;">'
     if logo_b64 else
-    '<div style="font-size:42px; font-weight:900; color:#991b1b; letter-spacing:2px;">OJAS</div><div style="font-size:12px; font-weight:700;">POWER OF INFORMATION • ఓజస్</div>'
+    f'<div style="font-size:44px; font-weight:900; color:{accent_primary}; letter-spacing:3px; line-height:1;">OJAS</div>'
+    f'<div style="font-size:12px; font-weight:800; color:#1e293b; letter-spacing:1.5px; margin-top:2px;">POWER OF INFORMATION • ఓజస్</div>'
 )
 
-# Photo Grid HTML (Compact Spacing)
+# Photo Grid HTML with Newspaper Frame Graphics & Photo Badges
 photos_html = ""
 if len(photo_b64_list) == 1:
     photos_html = f"""
-    <div style="margin: 6px 0 8px 0; border: 1.5px solid #cbd5e1; padding: 4px; background: #fff;">
-        <img src="data:image/jpeg;base64,{photo_b64_list[0]}" style="width: 100%; height: {photo_single_h}; object-fit: cover; display: block;">
-        <div style="font-size: 11.5px; color: #334155; padding: 3px 2px 0 2px; font-weight: 700;">
-            ▲ {captions[0]}
+    <div style="margin: 6px 0 8px 0; border: 1.5px solid #94a3b8; padding: 5px; background: {card_bg}; box-shadow: 0 2px 6px rgba(0,0,0,0.06); position: relative;">
+        <div style="position: relative;">
+            <img src="data:image/jpeg;base64,{photo_b64_list[0]}" style="width: 100%; height: {photo_single_h}; object-fit: cover; display: block; border: 1px solid #cbd5e1;">
+            <div style="position: absolute; bottom: 6px; right: 6px; background: rgba(15, 23, 42, 0.82); color: #fff; font-size: 9px; font-weight: 800; padding: 2px 7px; letter-spacing: 0.6px; border-left: 3px solid {accent_gold};">
+                OJAS PHOTO DESK
+            </div>
+        </div>
+        <div style="font-size: 11.5px; color: #1e293b; padding: 4px 3px 0 3px; font-weight: 700; display: flex; align-items: center; gap: 5px;">
+            <span style="color:{accent_primary}; font-size:10px;">■</span> {captions[0]}
         </div>
     </div>
     """
 elif len(photo_b64_list) >= 2:
     photos_html = f"""
     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 6px 0 8px 0;">
-        <div style="border: 1.5px solid #cbd5e1; padding: 4px; background: #fff;">
-            <img src="data:image/jpeg;base64,{photo_b64_list[0]}" style="width: 100%; height: {photo_dual_h}; object-fit: cover; display: block;">
-            <div style="font-size: 11px; color: #334155; padding-top: 3px; font-weight: 700; line-height: 1.25;">▲ {captions[0]}</div>
+        <div style="border: 1.5px solid #94a3b8; padding: 4px; background: {card_bg}; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
+            <div style="position: relative;">
+                <img src="data:image/jpeg;base64,{photo_b64_list[0]}" style="width: 100%; height: {photo_dual_h}; object-fit: cover; display: block; border: 1px solid #cbd5e1;">
+                <div style="position: absolute; top: 5px; left: 5px; background: {accent_primary}; color: #fff; font-size: 8.5px; font-weight: 800; padding: 1.5px 6px;">01</div>
+            </div>
+            <div style="font-size: 11px; color: #1e293b; padding-top: 3px; font-weight: 700; line-height: 1.25;">
+                <span style="color:{accent_primary};">■</span> {captions[0]}
+            </div>
         </div>
-        <div style="border: 1.5px solid #cbd5e1; padding: 4px; background: #fff;">
-            <img src="data:image/jpeg;base64,{photo_b64_list[1]}" style="width: 100%; height: {photo_dual_h}; object-fit: cover; display: block;">
-            <div style="font-size: 11px; color: #334155; padding-top: 3px; font-weight: 700; line-height: 1.25;">▲ {captions[1]}</div>
+        <div style="border: 1.5px solid #94a3b8; padding: 4px; background: {card_bg}; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
+            <div style="position: relative;">
+                <img src="data:image/jpeg;base64,{photo_b64_list[1]}" style="width: 100%; height: {photo_dual_h}; object-fit: cover; display: block; border: 1px solid #cbd5e1;">
+                <div style="position: absolute; top: 5px; left: 5px; background: #1e293b; color: #fff; font-size: 8.5px; font-weight: 800; padding: 1.5px 6px;">02</div>
+            </div>
+            <div style="font-size: 11px; color: #1e293b; padding-top: 3px; font-weight: 700; line-height: 1.25;">
+                <span style="color:{accent_gold};">■</span> {captions[1]}
+            </div>
         </div>
     </div>
     """
 
-# Video Box HTML (Compact Single-Page Proportions)
+# Video Box HTML
 qr_b64 = generate_qr_base64(video_play_url) if video_play_url.strip() else ""
 video_box_html = ""
 if has_video_section:
     thumb_visual = (
         f'<img src="data:image/jpeg;base64,{video_thumb_b64}" style="width:100%; height:{video_thumb_h}; object-fit:cover; display:block; filter: brightness(0.84);">'
         if video_thumb_b64 else
-        '<div style="width:100%; height:110px; background: linear-gradient(135deg, #0f172a 0%, #991b1b 100%);"></div>'
+        '<div style="width:100%; height:105px; background: linear-gradient(135deg, #0f172a 0%, #991b1b 100%);"></div>'
     )
     qr_html = (
-        f'<div style="background:#fff; padding:3px; border-radius:5px; text-align:center; border:1px solid #cbd5e1; flex-shrink:0;">'
-        f'<img src="data:image/png;base64,{qr_b64}" style="width:48px; height:48px; display:block;">'
-        f'<div style="font-size:7.5px; font-weight:800; color:#0f172a; margin-top:1px;">SCAN</div></div>'
+        f'<div style="background:#fff; padding:3px; border-radius:4px; text-align:center; border:1px solid #cbd5e1; flex-shrink:0;">'
+        f'<img src="data:image/png;base64,{qr_b64}" style="width:46px; height:46px; display:block;">'
+        f'<div style="font-size:7px; font-weight:800; color:#0f172a; margin-top:1px;">SCAN QR</div></div>'
         if qr_b64 else ""
     )
     clean_url_display = video_play_url.strip() if video_play_url.strip() else "Attached Digital Video Clip • OJAS E-Paper"
 
     video_box_html = f"""
-    <div id="video-hotspot" style="margin: 6px 0 8px 0; border: 2px solid #991b1b; background: #0f172a; border-radius: 5px; overflow: hidden; position: relative;">
+    <div id="video-hotspot" style="margin: 6px 0 8px 0; border: 2px solid {accent_primary}; background: #0f172a; border-radius: 4px; overflow: hidden; position: relative;">
         <div style="position: relative; width: 100%;">
             {thumb_visual}
-            <div style="position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(0,0,0,0.24);">
-                <div style="width: 48px; height: 48px; border-radius: 50%; background: rgba(220, 38, 38, 0.95); border: 2.5px solid #ffffff; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 14px rgba(0,0,0,0.45);">
-                    <div style="width: 0; height: 0; border-top: 9px solid transparent; border-bottom: 9px solid transparent; border-left: 16px solid #ffffff; margin-left: 3px;"></div>
+            <div style="position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(0,0,0,0.22);">
+                <div style="width: 46px; height: 46px; border-radius: 50%; background: rgba(220, 38, 38, 0.95); border: 2.5px solid #ffffff; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 14px rgba(0,0,0,0.45);">
+                    <div style="width: 0; height: 0; border-top: 9px solid transparent; border-bottom: 9px solid transparent; border-left: 15px solid #ffffff; margin-left: 3px;"></div>
                 </div>
-                <div style="margin-top: 6px; background: rgba(15, 23, 42, 0.9); color: #fef3c7; font-size: 11px; font-weight: 800; padding: 3px 11px; border-radius: 16px; border: 1px solid #f59e0b;">
+                <div style="margin-top: 5px; background: rgba(15, 23, 42, 0.92); color: #fef3c7; font-size: 10.5px; font-weight: 800; padding: 3px 11px; border-radius: 16px; border: 1px solid #f59e0b;">
                     ▶ {video_caption}
                 </div>
             </div>
         </div>
-        <div style="background: #fffbeb; padding: 5px 10px; display: flex; justify-content: space-between; align-items: center; gap: 8px; border-top: 1.5px solid #991b1b;">
+        <div style="background: #fffbeb; padding: 5px 10px; display: flex; justify-content: space-between; align-items: center; gap: 8px; border-top: 1.5px solid {accent_primary};">
             <div style="flex: 1;">
-                <div style="font-size: 10px; font-weight: 800; color: #991b1b;">🎬 OJAS MULTIMEDIA VIDEO</div>
-                <div style="font-size: 11px; color: #1e293b; font-weight: 600; word-break: break-all;">{clean_url_display}</div>
+                <div style="font-size: 9.5px; font-weight: 800; color: {accent_primary}; letter-spacing: 0.4px;">🎬 OJAS MULTIMEDIA VIDEO REPORT</div>
+                <div style="font-size: 10.5px; color: #1e293b; font-weight: 600; word-break: break-all;">{clean_url_display}</div>
             </div>
             {qr_html}
         </div>
     </div>
     """
 
-# Remove extra blank lines so text stays crisp & compact on a single page
+# Pull-Quote / Key Highlight Strip HTML
+pull_quote_text = st.session_state.get("pull_quote", "").strip()
+pull_quote_html = (
+    f"""
+    <div style="margin: 6px 0 8px 0; background: {quote_bg}; border-left: 4px solid {quote_border}; border-right: 4px solid {quote_border}; border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; padding: 5px 12px; text-align: center; font-size: 12.5px; font-weight: 800; color: #0f172a; letter-spacing: 0.2px;">
+        ❝ {pull_quote_text} ❞
+    </div>
+    """
+    if pull_quote_text else ""
+)
+
+# Compact paragraph formatting + Editorial Drop-Cap on English Lead
 te_clean_lines = [line.strip() for line in st.session_state["te_body"].split("\n") if line.strip()]
 en_clean_lines = [line.strip() for line in st.session_state["en_body"].split("\n") if line.strip()]
 te_body_formatted = "<br>".join(te_clean_lines)
 en_body_formatted = "<br>".join(en_clean_lines)
 
-te_sub_html = f'<div style="font-size: 13.5px; font-weight: 700; color: #991b1b; margin-bottom: 5px; line-height: 1.3;">◆ {st.session_state["te_subhead"]}</div>' if st.session_state["te_subhead"].strip() else ""
-en_sub_html = f'<div style="font-size: 12.8px; font-weight: 700; color: #b45309; margin-bottom: 5px; line-height: 1.3;">◆ {st.session_state["en_subhead"]}</div>' if st.session_state["en_subhead"].strip() else ""
+te_sub_html = f'<div style="font-size: 13.5px; font-weight: 700; color: {accent_primary}; margin-bottom: 5px; line-height: 1.3; border-left: 3px solid {accent_primary}; padding-left: 7px;">{st.session_state["te_subhead"]}</div>' if st.session_state["te_subhead"].strip() else ""
+en_sub_html = f'<div style="font-size: 12.8px; font-weight: 700; color: {accent_gold}; margin-bottom: 5px; line-height: 1.3; border-left: 3px solid {accent_gold}; padding-left: 7px;">{st.session_state["en_subhead"]}</div>' if st.session_state["en_subhead"].strip() else ""
 
 if layout_mode == "Bilingual Side-by-Side (Telugu + English)":
     news_columns_html = f"""
     <div style="display: grid; grid-template-columns: 1.08fr 1fr; gap: 16px; margin-top: 6px;">
         <div style="border-right: 1.5px solid #cbd5e1; padding-right: 14px;">
-            <div style="display:inline-block; background:#991b1b; color:#fff; font-size:9.5px; font-weight:800; padding:1.5px 7px; border-radius:2px; margin-bottom:4px;">తెలుగు</div>
-            <h2 style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_head_size}; font-weight: 800; color: #0f172a; line-height: 1.24; margin: 0 0 4px 0;">
+            <div style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">
+                <span style="background:{accent_primary}; color:#fff; font-size:9.5px; font-weight:800; padding:1.5px 7px; border-radius:2px;">తెలుగు వార్త</span>
+                <span style="flex:1; height:1px; background:#cbd5e1;"></span>
+            </div>
+            <h2 style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_head_size}; font-weight: 800; color: #0f172a; line-height: 1.24; margin: 0 0 5px 0;">
                 {st.session_state["te_headline"]}
             </h2>
             {te_sub_html}
@@ -728,12 +854,15 @@ if layout_mode == "Bilingual Side-by-Side (Telugu + English)":
             </div>
         </div>
         <div>
-            <div style="display:inline-block; background:#1e293b; color:#fff; font-size:9.5px; font-weight:800; padding:1.5px 7px; border-radius:2px; margin-bottom:4px; letter-spacing:0.4px;">ENGLISH</div>
-            <h2 style="font-family: 'Merriweather', Georgia, serif; font-size: {en_head_size}; font-weight: 900; color: #0f172a; line-height: 1.22; margin: 0 0 4px 0;">
+            <div style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">
+                <span style="background:#1e293b; color:#fff; font-size:9.5px; font-weight:800; padding:1.5px 7px; border-radius:2px; letter-spacing:0.4px;">ENGLISH REPORT</span>
+                <span style="flex:1; height:1px; background:#cbd5e1;"></span>
+            </div>
+            <h2 style="font-family: 'Merriweather', Georgia, serif; font-size: {en_head_size}; font-weight: 900; color: #0f172a; line-height: 1.22; margin: 0 0 5px 0;">
                 {st.session_state["en_headline"]}
             </h2>
             {en_sub_html}
-            <div style="font-family: 'Plus Jakarta Sans', sans-serif; font-size: {en_body_size}; line-height: 1.46; color: #1e293b; text-align: justify;">
+            <div class="en-dropcap" style="font-family: 'Plus Jakarta Sans', sans-serif; font-size: {en_body_size}; line-height: 1.46; color: #1e293b; text-align: justify;">
                 {en_body_formatted}
             </div>
         </div>
@@ -743,15 +872,15 @@ elif layout_mode == "Telugu Lead + English Box":
     col_count_te = 2 if not is_9_16 else 1
     news_columns_html = f"""
     <div style="margin-top: 6px;">
-        <h2 style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_head_size}; font-weight: 800; color: #0f172a; line-height: 1.24; margin: 0 0 4px 0;">
+        <h2 style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_head_size}; font-weight: 800; color: #0f172a; line-height: 1.24; margin: 0 0 5px 0;">
             {st.session_state["te_headline"]}
         </h2>
         {te_sub_html}
         <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_body_size}; line-height: 1.54; color: #1e293b; text-align: justify; column-count: {col_count_te}; column-gap: 18px; column-rule: 1px solid #cbd5e1;">
             {te_body_formatted}
         </div>
-        <div style="margin-top: 10px; background: #f8fafc; border-left: 4px solid #991b1b; border-top: 1px solid #cbd5e1; border-right: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1; padding: 9px 12px;">
-            <div style="font-size: 9.5px; font-weight: 800; color: #991b1b; letter-spacing: 0.8px; margin-bottom: 2px;">ENGLISH EDITION</div>
+        <div style="margin-top: 10px; background: {card_bg}; border-left: 4px solid {accent_primary}; border-top: 1px solid #cbd5e1; border-right: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1; padding: 9px 12px;">
+            <div style="font-size: 9.5px; font-weight: 800; color: {accent_primary}; letter-spacing: 0.8px; margin-bottom: 2px;">ENGLISH EDITION</div>
             <div style="font-family: 'Merriweather', Georgia, serif; font-size: 16px; font-weight: 800; color: #0f172a; margin-bottom: 3px; line-height: 1.22;">{st.session_state["en_headline"]}</div>
             <div style="font-size: {en_body_size}; line-height: 1.44; color: #334155; text-align: justify;">{en_body_formatted}</div>
         </div>
@@ -761,15 +890,15 @@ else:
     col_count_en = 2 if not is_9_16 else 1
     news_columns_html = f"""
     <div style="margin-top: 6px;">
-        <h2 style="font-family: 'Merriweather', Georgia, serif; font-size: {en_head_size}; font-weight: 900; color: #0f172a; line-height: 1.22; margin: 0 0 4px 0;">
+        <h2 style="font-family: 'Merriweather', Georgia, serif; font-size: {en_head_size}; font-weight: 900; color: #0f172a; line-height: 1.22; margin: 0 0 5px 0;">
             {st.session_state["en_headline"]}
         </h2>
         {en_sub_html}
-        <div style="font-size: {en_body_size}; line-height: 1.48; color: #1e293b; text-align: justify; column-count: {col_count_en}; column-gap: 18px; column-rule: 1px solid #cbd5e1;">
+        <div class="en-dropcap" style="font-size: {en_body_size}; line-height: 1.48; color: #1e293b; text-align: justify; column-count: {col_count_en}; column-gap: 18px; column-rule: 1px solid #cbd5e1;">
             {en_body_formatted}
         </div>
-        <div style="margin-top: 10px; background: #fffbeb; border-left: 4px solid #b45309; border-top: 1px solid #fde68a; border-right: 1px solid #fde68a; border-bottom: 1px solid #fde68a; padding: 9px 12px;">
-            <div style="font-size: 10px; font-weight: 800; color: #b45309; margin-bottom: 2px;">తెలుగు సంచిక</div>
+        <div style="margin-top: 10px; background: {quote_bg}; border-left: 4px solid {accent_gold}; border-top: 1px solid #fde68a; border-right: 1px solid #fde68a; border-bottom: 1px solid #fde68a; padding: 9px 12px;">
+            <div style="font-size: 10px; font-weight: 800; color: {accent_gold}; margin-bottom: 2px;">తెలుగు సంచిక</div>
             <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: 17px; font-weight: 800; color: #0f172a; margin-bottom: 3px; line-height: 1.24;">{st.session_state["te_headline"]}</div>
             <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_body_size}; line-height: 1.5; color: #334155; text-align: justify;">{te_body_formatted}</div>
         </div>
@@ -781,7 +910,7 @@ escaped_video_url = json.dumps(video_play_url.strip())
 
 # ----------------- RIGHT COLUMN: SINGLE-PAGE LIVE PREVIEW & HD JPEG / PDF EXPORT -----------------
 with col_preview:
-    st.subheader("🗞️ 2. Single-Page Newspaper Preview & Export")
+    st.subheader("🗞️ 2. Print-Grade E-Paper Preview & Export")
 
     newspaper_widget_html = f"""
     <!DOCTYPE html>
@@ -850,28 +979,57 @@ with col_preview:
         #scale-holder {{
             transform-origin: top left;
         }}
-        /* Fixed Single-Page Master Canvas */
+        /* Authentic Print-Grade Newspaper Broadsheet Frame */
         #newspaper-sheet {{
             width: {sheet_width_px}px;
             {sheet_height_css}
             background-color: {bg_paper};
-            border: 2.5px solid #1e293b;
+            border: 3px double #1e293b;
+            outline: 1px solid {accent_primary};
+            outline-offset: -6px;
             padding: 16px 22px 12px 22px;
-            box-shadow: 0 8px 24px rgba(0,0,0,0.14);
+            box-shadow: 0 10px 28px rgba(0,0,0,0.16);
             color: #0f172a;
+        }}
+        .masthead-header {{
+            display: grid;
+            grid-template-columns: 110px 1fr 110px;
+            align-items: center;
+            gap: 8px;
+            padding-bottom: 5px;
+        }}
+        .edition-box-left {{
+            border: 1px solid #94a3b8;
+            background: {card_bg};
+            padding: 4px 6px;
+            font-size: 9px;
+            font-weight: 800;
+            color: #1e293b;
+            line-height: 1.3;
+            text-align: left;
+        }}
+        .edition-box-right {{
+            border: 1px solid #94a3b8;
+            background: {card_bg};
+            padding: 4px 6px;
+            font-size: 9px;
+            font-weight: 800;
+            color: {accent_primary};
+            line-height: 1.3;
+            text-align: right;
         }}
         .masthead-wrap {{
             text-align: center;
-            padding-bottom: 6px;
         }}
         .dateline-bar {{
             display: flex;
             justify-content: space-between;
             align-items: center;
-            border-top: 2.5px solid #991b1b;
+            border-top: 3px solid {accent_primary};
             border-bottom: 1.5px solid #1e293b;
-            padding: 4px 4px;
-            font-size: 11.5px;
+            background: linear-gradient(90deg, rgba(153,27,27,0.05) 0%, rgba(217,119,6,0.06) 50%, rgba(153,27,27,0.05) 100%);
+            padding: 4px 6px;
+            font-size: 11px;
             font-weight: 800;
             color: #1e293b;
             text-transform: uppercase;
@@ -880,22 +1038,42 @@ with col_preview:
             gap: 6px;
         }}
         .section-pill {{
-            background: #991b1b;
+            background: linear-gradient(90deg, {accent_primary}, #b91c1c);
             color: #ffffff;
-            padding: 2px 9px;
-            font-size: 10.5px;
+            padding: 2px 10px;
+            font-size: 10px;
             font-weight: 800;
             border-radius: 2px;
+            letter-spacing: 0.5px;
+        }}
+        .en-dropcap::first-letter {{
+            float: left;
+            font-family: 'Merriweather', Georgia, serif;
+            font-size: 36px;
+            line-height: 0.85;
+            padding-top: 3px;
+            padding-right: 6px;
+            padding-left: 1px;
+            font-weight: 900;
+            color: {accent_primary};
+        }}
+        .ornament-rule {{
+            text-align: center;
+            font-size: 10px;
+            color: {accent_gold};
+            letter-spacing: 4px;
+            margin-top: 6px;
+            line-height: 1;
         }}
         .footer-strip {{
-            margin-top: 8px;
-            padding-top: 6px;
-            border-top: 2px solid #991b1b;
+            margin-top: 4px;
+            padding-top: 5px;
+            border-top: 2px solid {accent_primary};
             display: flex;
             justify-content: space-between;
-            font-size: 11px;
-            font-weight: 700;
-            color: #475569;
+            font-size: 10.5px;
+            font-weight: 800;
+            color: #334155;
         }}
     </style>
     </head>
@@ -910,26 +1088,43 @@ with col_preview:
             <div id="scale-holder">
                 <div id="newspaper-sheet">
                     <div>
-                        <div class="masthead-wrap">
-                            {logo_html}
+                        <div class="masthead-header">
+                            <div class="edition-box-left">
+                                DIGITAL BROADSHEET<br>
+                                <span style="color:{accent_primary};">BILINGUAL EDITION</span><br>
+                                TELUGU • ENGLISH
+                            </div>
+                            <div class="masthead-wrap">
+                                {logo_html}
+                            </div>
+                            <div class="edition-box-right">
+                                OJAS MEDIA<br>
+                                <span style="color:#1e293b;">VERIFIED NEWS</span><br>
+                                {telugu_date_str}
+                            </div>
                         </div>
 
                         <div class="dateline-bar">
                             <span>{edition_name}</span>
                             <span class="section-pill">{category_tag}</span>
-                            <span>{formatted_date} ({telugu_date_str})</span>
+                            <span>{formatted_date}</span>
                         </div>
 
                         {photos_html}
 
                         {video_box_html}
 
+                        {pull_quote_html}
+
                         {news_columns_html}
                     </div>
 
-                    <div class="footer-strip">
-                        <span>{vol_issue}</span>
-                        <span>{footer_credit}</span>
+                    <div>
+                        <div class="ornament-rule">❖ ◆ ❖</div>
+                        <div class="footer-strip">
+                            <span>{vol_issue}</span>
+                            <span>{footer_credit}</span>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1021,7 +1216,6 @@ with col_preview:
                     const pageWidth = pdf.internal.pageSize.getWidth();
                     const pageHeight = pdf.internal.pageSize.getHeight();
 
-                    // Strict 1-Page Edge-to-Edge Fit
                     pdf.addImage(imgData, "JPEG", 0, 0, pageWidth, pageHeight);
 
                     if (videoRect && VIDEO_URL) {{
