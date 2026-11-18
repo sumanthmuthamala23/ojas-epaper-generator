@@ -102,27 +102,59 @@ def generate_qr_base64(url: str) -> str:
         pass
     return ""
 
-# ----------------- TEXT & TRANSLATION HELPERS -----------------
+# ----------------- TEXT & BULLETPROOF TWO-WAY TRANSLATION HELPERS -----------------
+def clean_whatsapp_formatting(text: str) -> str:
+    """Strips WhatsApp *bold* / _italic_ markers and bullet symbols that break URL translation."""
+    cleaned = text.replace("*", "").replace("_", "").replace("◆", "").replace("•", "")
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
 def detect_telugu(text: str) -> bool:
     """Detects whether the input text is predominantly in Telugu script."""
     te_chars = len(re.findall(r'[\u0C00-\u0C7F]', text))
     en_chars = len(re.findall(r'[A-Za-z]', text))
     return te_chars > en_chars
 
-def free_translate_text(text: str, source_lang: str, target_lang: str) -> str:
-    """Fallback translator between Telugu ('te') and English ('en') when no API key is configured."""
+def chunked_free_translate(text: str, source_lang: str, target_lang: str) -> str:
+    """
+    Bulletproof sentence-by-sentence free translator between Telugu ('te') and English ('en').
+    Prevents long-URL truncation so the entire news body translates cleanly every time.
+    """
     if not text.strip():
         return ""
-    try:
-        url = (
-            "https://translate.googleapis.com/translate_a/single"
-            f"?client=gtx&sl={source_lang}&tl={target_lang}&dt=t&q={urllib.parse.quote(text[:4500])}"
-        )
-        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
-        data = res.json()
-        return "".join([seg[0] for seg in data[0] if seg[0]]).strip()
-    except Exception:
-        return text
+    cleaned = clean_whatsapp_formatting(text)
+    # Split into manageable sentence chunks (< 400 chars each)
+    raw_sentences = re.split(r'(?<=[.!?।])\s+', cleaned)
+    chunks = []
+    current = ""
+    for s in raw_sentences:
+        if len(current) + len(s) < 380:
+            current = (current + " " + s).strip()
+        else:
+            if current:
+                chunks.append(current)
+            current = s[:380]
+    if current:
+        chunks.append(current)
+
+    translated_parts = []
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for chunk in chunks:
+        try:
+            url = (
+                "https://translate.googleapis.com/translate_a/single"
+                f"?client=gtx&sl={source_lang}&tl={target_lang}&dt=t&q={urllib.parse.quote(chunk)}"
+            )
+            res = requests.get(url, headers=headers, timeout=8)
+            if res.status_code == 200:
+                data = res.json()
+                piece = "".join([seg[0] for seg in data[0] if seg and seg[0]]).strip()
+                translated_parts.append(piece if piece else chunk)
+            else:
+                translated_parts.append(chunk)
+        except Exception:
+            translated_parts.append(chunk)
+    return " ".join(translated_parts).strip()
 
 def smart_condense_to_word_budget(text: str, max_words: int) -> str:
     """Trims text cleanly at sentence boundaries to fit single-page column budgets."""
@@ -172,20 +204,17 @@ def transliterate_to_telugu(text: str) -> str:
         converted_lines.append(" ".join(out_words))
     return "\n".join(converted_lines)
 
-# ----------------- PROFESSIONAL GEMINI NEWSROOM ENGINE -----------------
+# ----------------- PROFESSIONAL GEMINI 3.8 NEWSROOM ENGINE -----------------
 def discover_active_gemini_models(client) -> list:
-    """Discovers active Gemini models on the user's API key and prioritizes latest 3.x / 4.x models."""
+    """Prioritizes gemini-3.8-flash and active models on the user's API key."""
     preferred_order = [
         "gemini-3.8-flash",
+        "gemini-3.8-pro",
         "gemini-3.5-flash-lite",
         "gemini-3.5-flash",
-        "gemini-3.6-flash",
-        "gemini-3.1-flash-lite",
         "gemini-3-flash-preview",
-        "gemini-4-hydrogen",
-        "gemini-4-argon",
         "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
     ]
     discovered = []
     try:
@@ -199,7 +228,7 @@ def discover_active_gemini_models(client) -> list:
 
     ordered = [m for m in preferred_order if m in discovered]
     for m in discovered:
-        if m not in ordered and ("flash" in m or "hydrogen" in m or "argon" in m) and "tts" not in m and "image" not in m and "live" not in m:
+        if m not in ordered and ("flash" in m or "pro" in m) and "tts" not in m and "image" not in m and "live" not in m:
             ordered.append(m)
     return ordered if ordered else preferred_order
 
@@ -212,43 +241,40 @@ def ai_editorial_bilingual_engine(
     editorial_style: str
 ) -> tuple[dict, str]:
     """
-    Chief-Editor AI Newsroom Engine using active Gemini 3.8 / 3.5 / 4 models:
-    - Produces authentic Telugu పత్రికా భాష (Eenadu / Sakshi style) AND crisp English print journalism (The Hindu / DC style)
-    - Extracts a high-impact pull-quote / key takeaway highlight box
-    - Applies Inverted Pyramid editing & strict single-page word budgeting
+    Chief-Editor AI Newsroom Engine using Gemini 3.8 Flash:
+    - Translates and edits BOTH headline AND full body between Telugu and English
+    - Never uses markdown asterisks (*) in output
+    - Produces authentic Telugu పత్రికా భాష (Eenadu / Sakshi style) & crisp English print copy
     """
     last_err = None
 
     prompt = f"""
-    You are the Chief News Editor & Bilingual Copy Desk Director of 'OJAS - Power of Information' (ఓజస్), a premier Telugu-English bilingual daily newspaper in Telangana & Andhra Pradesh.
+    You are the Chief News Editor & Bilingual Copy Desk Director of 'OJAS - Power of Information' (ఓజస్), a premier Telugu-English daily newspaper in Telangana & Andhra Pradesh.
 
-    MISSION:
-    Analyze the RAW NEWS INPUT (which may be in Telugu, English, Tanglish, or rough field notes) and produce publication-ready, authentic bilingual newspaper copy.
+    TASK:
+    Convert the RAW NEWS INPUT below into publication-ready bilingual newspaper copy.
+    - If the input is in Telugu -> refine the Telugu copy AND fully translate/transcreate the ENTIRE headline, subhead, and full news body into crisp English print journalism.
+    - If the input is in English -> refine the English copy AND fully translate/transcreate the ENTIRE headline, subhead, and full news body into authentic journalistic Telugu (పత్రికా భాష).
 
-    PROFESSIONAL JOURNALISTIC & TRANSLATION RULES:
-    1. NEVER do literal word-for-word machine translation. Transcreate like a senior bilingual sub-editor:
-       - **Telugu Copy (`te_headline`, `te_subhead`, `te_body`)**: Use high-register, natural Telugu print journalism (*పత్రికా భాష* — *Eenadu / Sakshi / Namasthe Telangana* style). Start with a proper dateline (e.g., `కోదాడ, న్యూస్‌టుడే:` or `{location}:`). Use authentic reporting verbs (*పేర్కొన్నారు, వెల్లడించారు, స్పష్టం చేశారు, డిమాండ్ చేశారు, ఆదేశించారు, హెచ్చరించారు*). Keep official designations accurate (*ఎమ్మెల్సీ, కలెక్టర్, ఆర్డీవో, తహసీల్దార్, మున్సిపల్ కమిషనర్*).
-       - **English Copy (`en_headline`, `en_subhead`, `en_body`)**: Use crisp, authoritative Indian print journalism (*The Hindu / Deccan Chronicle* style). Start with an uppercase dateline (e.g., `KODAD:`). Use active voice, sharp journalistic verbs, and clear attribution.
-    2. **News Editing Techniques**:
-       - **Inverted Pyramid**: Lead with the core news, decision, or impact in the very first sentence.
-       - **Headline Craft**: Make headlines punchy, active, and specific—never vague.
-       - **Pull-Quote / Key Highlight**: Extract 1 crisp, high-impact takeaway line (`highlight_quote`) in bilingual or lead language for the newspaper callout box.
-       - **Editorial Angle**: {editorial_style}
-       - **Dateline / Bureau**: {location}
-       - **SINGLE-PAGE WORD BUDGET**: Keep `te_body` strictly around {target_te_words} words (max {target_te_words + 12} words) and `en_body` strictly around {target_en_words} words (max {target_en_words + 12} words). Format as 1 or 2 tight paragraphs with NO empty blank lines.
+    STRICT JOURNALISTIC & FORMATTING RULES:
+    1. BOTH `te_body` and `en_body` MUST be completely translated into their respective target languages. NEVER leave Telugu text inside `en_body` or English sentences inside `te_body`.
+    2. DO NOT use any markdown symbols like `*`, `**`, `#`, or `_` anywhere in the JSON values. Plain clean text only.
+    3. **Telugu Style (`te_headline`, `te_subhead`, `te_body`)**: Authentic Telugu print journalism (*Eenadu / Sakshi / Namasthe Telangana* style). Start body with dateline (e.g., `{location.split('•')[-1].strip()}:`). Use formal journalistic verbs (*పేర్కొన్నారు, వెల్లడించారు, డిమాండ్ చేశారు, విమర్శించారు, ఆదేశించారు*).
+    4. **English Style (`en_headline`, `en_subhead`, `en_body`)**: Crisp *The Hindu / Deccan Chronicle* style. Start body with uppercase dateline (e.g., `{location.split('•')[-1].strip().upper()}:`).
+    5. **Editing & Word Budget**: {editorial_style}. Keep `te_body` around {target_te_words} words and `en_body` around {target_en_words} words in 1–2 tight paragraphs with NO empty lines.
 
     RAW NEWS INPUT:
     {raw_input}
 
-    Return STRICTLY valid JSON with these exact keys (no markdown fences):
+    Return STRICTLY valid JSON with these exact keys:
     {{
-        "te_headline": "Punchy 5-8 word journalistic Telugu headline",
-        "te_subhead": "Crisp 1-line Telugu deck sub-headline",
-        "te_body": "Authentic journalistic Telugu report within {target_te_words} words",
-        "en_headline": "Punchy 6-10 word journalistic English headline",
-        "en_subhead": "Crisp 1-line English deck sub-headline",
-        "en_body": "Authentic journalistic English report within {target_en_words} words",
-        "pull_quote": "1 sharp key takeaway / quote (max 14 words)"
+        "te_headline": "Punchy 5-8 word journalistic Telugu headline (no asterisks)",
+        "te_subhead": "Crisp 1-line Telugu deck sub-headline (no asterisks)",
+        "te_body": "Full journalistic Telugu report within {target_te_words} words (no asterisks)",
+        "en_headline": "Punchy 6-10 word journalistic English headline (no asterisks)",
+        "en_subhead": "Crisp 1-line English deck sub-headline (no asterisks)",
+        "en_body": "Full journalistic English report within {target_en_words} words (no asterisks)",
+        "pull_quote": "1 sharp key takeaway quote (max 14 words, no asterisks)"
     }}
     """
 
@@ -270,6 +296,9 @@ def ai_editorial_bilingual_engine(
                     )
                     if res and res.text:
                         parsed = json.loads(res.text)
+                        for k_clean in parsed:
+                            if isinstance(parsed[k_clean], str):
+                                parsed[k_clean] = parsed[k_clean].replace("*", "").strip()
                         return parsed, m_name
                 except Exception as e:
                     last_err = e
@@ -291,7 +320,7 @@ def process_bilingual_auto_fit(
     target_en_words: int,
     editorial_style: str
 ) -> tuple[dict, str]:
-    """Runs Gemini Chief-Editor AI if API key is available; otherwise uses free two-way translation fallback."""
+    """Runs Gemini 3.8 Chief-Editor AI if API key is available; otherwise uses chunked sentence-by-sentence free translator."""
     valid_keys = [k for k in keys if k and k.strip()]
     if valid_keys and HAS_GENAI:
         try:
@@ -299,25 +328,32 @@ def process_bilingual_auto_fit(
                 valid_keys, raw_text, location, target_te_words, target_en_words, editorial_style
             )
         except Exception as e:
-            st.warning(f"Gemini API notice ({e}) — using free instant translation fallback.")
+            st.warning(f"Gemini API notice ({e}) — using chunked free bilingual translator.")
 
-    # Free Unlimited Fallback (Zero API Key Needed)
-    is_te = detect_telugu(raw_text)
+    # Bulletproof Chunked Free Fallback (Translates EVERY sentence in both headline & body)
+    cleaned_raw = clean_whatsapp_formatting(raw_text)
+    is_te = detect_telugu(cleaned_raw)
     lines = [l.strip() for l in raw_text.strip().split("\n") if l.strip()]
-    first_line = lines[0] if lines else raw_text.strip()[:70]
-    body_raw = " ".join(lines[1:]) if len(lines) > 1 else raw_text.strip()
+
+    if len(lines) > 1:
+        first_line = clean_whatsapp_formatting(lines[0])
+        body_raw = clean_whatsapp_formatting(" ".join(lines[1:]))
+    else:
+        sents = re.split(r'(?<=[.!?।])\s+', cleaned_raw)
+        first_line = sents[0][:95] if sents else cleaned_raw[:85]
+        body_raw = cleaned_raw
 
     if is_te:
-        te_head = first_line[:90]
+        te_head = first_line[:95]
         te_body = smart_condense_to_word_budget(body_raw, target_te_words)
-        en_head = free_translate_text(te_head, "te", "en")
-        en_body_full = free_translate_text(body_raw, "te", "en")
+        en_head = chunked_free_translate(te_head, "te", "en")
+        en_body_full = chunked_free_translate(te_body, "te", "en")
         en_body = smart_condense_to_word_budget(en_body_full, target_en_words)
     else:
-        en_head = first_line[:95]
+        en_head = first_line[:100]
         en_body = smart_condense_to_word_budget(body_raw, target_en_words)
-        te_head = free_translate_text(en_head, "en", "te")
-        te_body_full = free_translate_text(body_raw, "en", "te")
+        te_head = chunked_free_translate(en_head, "en", "te")
+        te_body_full = chunked_free_translate(en_body, "en", "te")
         te_body = smart_condense_to_word_budget(te_body_full, target_te_words)
 
     return {
@@ -328,7 +364,7 @@ def process_bilingual_auto_fit(
         "en_subhead": "",
         "en_body": en_body,
         "pull_quote": ""
-    }, "Free Fallback Translator"
+    }, "Chunked Bilingual Translator"
 
 # ----------------- CUSTOM RESPONSIVE APP STYLING -----------------
 bg_b64 = load_image_base64(["background.png"])
@@ -366,7 +402,7 @@ st.markdown(f"""
     .top-brand-bar {{
         background: linear-gradient(90deg, #7f1d1d 0%, #b91c1c 58%, #d97706 100%);
         color: white;
-        padding: 15px 24px;
+        padding: 14px 22px;
         border-radius: 14px;
         margin-bottom: 16px;
         box-shadow: 0 8px 22px rgba(127, 29, 29, 0.22);
@@ -408,9 +444,16 @@ defaults = {
     "en_headline": "Special Action Plan Launched to Resolve Public Grievances",
     "en_subhead": "Officials directed to conduct field visits and ensure swift redressal",
     "en_body": "KODAD: Authorities have rolled out a dedicated action plan to resolve civic and infrastructure issues across urban and rural pockets on a war footing. Officials have been instructed to prioritize drinking water supply, road repairs, and sanitation works with strict timelines.",
-    "pull_quote": "ప్రజా సమస్యల పరిష్కారంలో అలసత్వం వహిస్తే కఠిన చర్యలు తప్పవు • Zero tolerance for delay in civic works",
+    "pull_quote": "",
     "raw_bilingual_input": "",
-    "last_engine_used": ""
+    "last_engine_used": "",
+    # Secondary News Item (Optional to fill lower broadsheet space)
+    "enable_story_2": False,
+    "s2_raw_input": "",
+    "s2_te_headline": "రైతులకు సకాలంలో ఎరువులు, విత్తనాలు అందించాలి",
+    "s2_te_body": "ఖమ్మం: జిల్లాలోని అన్ని సహకార సంఘాల్లో సరిపడా యూరియా, విత్తనాలను అందుబాటులో ఉంచాలని నాయకులు అధికారులను కోరారు.",
+    "s2_en_headline": "Ensure Timely Supply of Fertilizers and Seeds to Farmers",
+    "s2_en_body": "KHAMMAM: Leaders urged agricultural officials to maintain adequate stocks of urea and quality seeds across all cooperative societies.",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -428,14 +471,16 @@ with st.sidebar:
     else:
         st.warning("⚠️ Upload `OJAS.png` to your GitHub repo to display the masthead logo.")
 
-    st.subheader("📐 1. Single-Page Format & Ratio")
+    st.subheader("📐 1. Page Format & Blank-Space Control")
     aspect_preset = st.radio(
-        "Choose Edition Ratio:",
+        "Choose Edition Format:",
         [
-            "📰 Broadsheet E-Paper (A4 / iPad / Computer — 1 Page)",
-            "📱 9:16 Vertical E-Paper (Mobile / WhatsApp Status — 1 Page)"
+            "✂️ Auto-Trim Clipping (Zero Blank Space — Tight Fit)",
+            "📰 Full A4 Broadsheet (Multi-Story / Full Page)",
+            "📱 9:16 Vertical E-Paper (Mobile / WhatsApp Status)"
         ],
-        index=0
+        index=0,
+        help="Auto-Trim removes all leftover blank space at the bottom so your JPEG & PDF hug the news clipping cleanly."
     )
 
     editorial_style = st.selectbox(
@@ -453,7 +498,7 @@ with st.sidebar:
     formatted_date = pub_date.strftime("%A, %d %B %Y")
     telugu_date_str = pub_date.strftime("%d-%m-%Y")
 
-    edition_name = st.text_input("Edition / Bureau", value="TELANGANA EDITION • KODAD")
+    edition_name = st.text_input("Edition / Bureau", value="TELANGANA EDITION • KHAMMAM")
     vol_issue = st.text_input("Volume / Issue", value="VOL. 01 | ISSUE 142 | DAILY DIGITAL")
     category_tag = st.selectbox(
         "Section Ribbon",
@@ -487,7 +532,7 @@ with st.sidebar:
 
     st.divider()
     with st.expander("🔑 Gemini AI Key (For Chief-Editor Newsroom Translation)", expanded=True):
-        st.caption("Connects directly to Gemini 3.8 / 3.5 Flash for authentic Telugu (పత్రికా భాష) & English newsroom translation.")
+        st.caption("Uses Gemini 3.8 Flash for full headline + body translation in authentic Telugu (పత్రికా భాష) & English.")
         secret_key = ""
         backup_secret = ""
         try:
@@ -516,14 +561,14 @@ if backup_secret and backup_secret != gemini_key:
 st.markdown("""
 <div class="top-brand-bar">
     <h1>📰 OJAS — Power of Information (ఓజస్) E-Paper Studio</h1>
-    <p>Gemini AI Newsroom Translation (Telugu ↔ English) • Single-Page Broadsheet & 9:16 Mobile • 1–2 Photos + Video PDF</p>
+    <p>Full Telugu ↔ English Newsroom Translation • Auto-Trim Zero Blank Space • Multi-Story & Video PDF</p>
 </div>
 """, unsafe_allow_html=True)
 
 col_editor, col_preview = st.columns([0.95, 1.35], gap="large")
 
 with col_editor:
-    st.subheader("✍️ 1. Smart Bilingual News Desk")
+    st.subheader("✍️ 1. Lead News & Bilingual Desk")
 
     with st.expander("🔤 Type English Phonetics ➔ Instant Telugu (100% Free)", expanded=False):
         phonetic_in = st.text_input(
@@ -534,24 +579,25 @@ with col_editor:
             if phonetic_in.strip():
                 st.code(transliterate_to_telugu(phonetic_in), language=None)
 
-    st.markdown("##### ⚡ Paste News in Telugu OR English (AI Newsroom Auto-Translate & 1-Page Fit)")
+    st.markdown("##### ⚡ Paste Lead News in Telugu OR English (Translates Both Headline & Full Body)")
     raw_news_input = st.text_area(
-        "Paste raw report, press note, or field details in Telugu or English:",
+        "Paste raw report, press note, or WhatsApp news in Telugu or English:",
         value=st.session_state["raw_bilingual_input"],
-        height=135,
-        placeholder="Paste news in Telugu OR English here. Gemini AI will translate it using authentic newspaper terminology, craft punchy headlines + highlight quote, and condense it to fit cleanly on 1 single page..."
+        height=130,
+        placeholder="Paste news in Telugu OR English here. Clicking below translates BOTH the headline and the entire body text into the other language..."
     )
 
     is_9_16 = "9:16" in aspect_preset
-    target_te_words = 72 if is_9_16 else 112
-    target_en_words = 82 if is_9_16 else 126
+    is_auto_trim = "Auto-Trim" in aspect_preset
+    target_te_words = 75 if is_9_16 else 125
+    target_en_words = 85 if is_9_16 else 140
 
-    if st.button("⚡ AI Newsroom Translate (Telugu ↔ English) & Fit 1 Page", type="primary", use_container_width=True):
+    if st.button("⚡ AI Newsroom Translate (Telugu ↔ English) & Format", type="primary", use_container_width=True):
         if not raw_news_input.strip():
             st.warning("Please enter or paste your news text in Telugu or English first.")
         else:
             st.session_state["raw_bilingual_input"] = raw_news_input
-            with st.spinner("Chief Editor AI is translating & formatting your bilingual newspaper edition..."):
+            with st.spinner("Translating headline & full body into bilingual newspaper format..."):
                 result, used_engine = process_bilingual_auto_fit(
                     active_keys,
                     raw_news_input,
@@ -564,15 +610,16 @@ with col_editor:
                 for k in ["te_headline", "te_subhead", "te_body", "en_headline", "en_subhead", "en_body", "pull_quote"]:
                     if k in result:
                         st.session_state[k] = result[k]
-                st.success(f"✅ Translated & edited via {used_engine} to fit 1 single page!")
+                st.success(f"✅ Headline & full body translated via {used_engine}!")
                 st.rerun()
 
     st.write("")
-    tab_te, tab_en, tab_photos, tab_video = st.tabs([
+    tab_te, tab_en, tab_photos, tab_video, tab_story2 = st.tabs([
         "తెలుగు (Edit)",
         "🇬🇧 English (Edit)",
         "📸 Photos (Max 2)",
-        "🎬 Video"
+        "🎬 Video",
+        "➕ 2nd News"
     ])
 
     with tab_te:
@@ -587,10 +634,10 @@ with col_editor:
         st.session_state["te_body"] = st.text_area(
             "తెలుగు వార్తా వివరాలు (Telugu News Body)",
             value=st.session_state["te_body"],
-            height=155
+            height=150
         )
         st.session_state["pull_quote"] = st.text_input(
-            "💎 ముఖ్యాంశం / Quote Ribbon (Optional Highlight Box)",
+            "💎 ముఖ్యాంశం / Quote Ribbon (Optional)",
             value=st.session_state["pull_quote"]
         )
 
@@ -606,7 +653,7 @@ with col_editor:
         st.session_state["en_body"] = st.text_area(
             "English News Body",
             value=st.session_state["en_body"],
-            height=155
+            height=150
         )
 
     with tab_photos:
@@ -675,6 +722,48 @@ with col_editor:
         if custom_video_thumb is not None:
             video_thumb_b64 = image_to_base64(custom_video_thumb)
 
+    # TAB 5: OPTIONAL 2ND NEWS STORY TO FILL LOWER BROADSHEET SPACE
+    with tab_story2:
+        st.session_state["enable_story_2"] = st.checkbox(
+            "➕ Include 2nd News Item on This Page (Fills Lower Broadsheet Space)",
+            value=st.session_state["enable_story_2"]
+        )
+        s2_photo_b64 = ""
+        s2_photo_cap = ""
+        if st.session_state["enable_story_2"]:
+            st.session_state["s2_raw_input"] = st.text_area(
+                "Paste 2nd News in Telugu or English:",
+                value=st.session_state["s2_raw_input"],
+                height=90,
+                placeholder="Paste brief 2nd news story here..."
+            )
+            if st.button("⚡ Auto-Translate 2nd News (Telugu ↔ English)", use_container_width=True):
+                if st.session_state["s2_raw_input"].strip():
+                    with st.spinner("Translating 2nd news item..."):
+                        res2, _ = process_bilingual_auto_fit(
+                            active_keys,
+                            st.session_state["s2_raw_input"],
+                            edition_name,
+                            55,
+                            65,
+                            editorial_style
+                        )
+                        st.session_state["s2_te_headline"] = res2.get("te_headline", "")
+                        st.session_state["s2_te_body"] = res2.get("te_body", "")
+                        st.session_state["s2_en_headline"] = res2.get("en_headline", "")
+                        st.session_state["s2_en_body"] = res2.get("en_body", "")
+                        st.rerun()
+
+            st.session_state["s2_te_headline"] = st.text_input("2nd News Telugu Headline", value=st.session_state["s2_te_headline"])
+            st.session_state["s2_te_body"] = st.text_area("2nd News Telugu Body", value=st.session_state["s2_te_body"], height=80)
+            st.session_state["s2_en_headline"] = st.text_input("2nd News English Headline", value=st.session_state["s2_en_headline"])
+            st.session_state["s2_en_body"] = st.text_area("2nd News English Body", value=st.session_state["s2_en_body"], height=80)
+
+            s2_photo = st.file_uploader("📷 Optional Photo for 2nd News", type=["jpg", "jpeg", "png", "webp"], key="s2_photo_slot")
+            if s2_photo is not None:
+                s2_photo_b64 = image_to_base64(s2_photo, max_width=900)
+                s2_photo_cap = st.text_input("2nd News Photo Caption", value="సమావేశ దృశ్యం / Event glimpse")
+
     footer_credit = st.text_input(
         "Reporter / Bureau Footer Line",
         value="OJAS DIGITAL NEWS NETWORK • POWER OF INFORMATION"
@@ -707,7 +796,8 @@ has_video_section = bool(uploaded_video is not None or video_play_url.strip() or
 
 if is_9_16:
     sheet_width_px = 720
-    sheet_height_css = "height: 1280px; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between;"
+    # 9:16 mobile canvas (minimum 1280px height, or hugs content if Auto-Trim is selected)
+    sheet_height_css = "height: auto;" if is_auto_trim else "min-height: 1280px; display: flex; flex-direction: column; justify-content: space-between;"
     logo_max_h = "84px"
     photo_single_h = "205px" if not has_video_section else "160px"
     photo_dual_h = "155px" if not has_video_section else "128px"
@@ -716,10 +806,10 @@ if is_9_16:
     en_head_size = "18px"
     te_body_size = "13.6px"
     en_body_size = "12.8px"
-    pdf_format_js = "[144, 256]"
-else:
+elif is_auto_trim:
+    # Auto-Trim Clipping: Wide 980px Broadsheet width, height hugs the exact content with zero blank bottom gap!
     sheet_width_px = 980
-    sheet_height_css = "height: 1386px; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between;"
+    sheet_height_css = "height: auto;"
     logo_max_h = "108px"
     photo_single_h = "275px" if not has_video_section else "210px"
     photo_dual_h = "205px" if not has_video_section else "162px"
@@ -728,7 +818,18 @@ else:
     en_head_size = "22px"
     te_body_size = "15px"
     en_body_size = "14px"
-    pdf_format_js = '"a4"'
+else:
+    # Full A4 Broadsheet (980 x 1386 master -> 1960 x 2772 HD)
+    sheet_width_px = 980
+    sheet_height_css = "min-height: 1386px; display: flex; flex-direction: column; justify-content: space-between;"
+    logo_max_h = "108px"
+    photo_single_h = "275px" if not has_video_section else "210px"
+    photo_dual_h = "205px" if not has_video_section else "162px"
+    video_thumb_h = "175px"
+    te_head_size = "25.5px"
+    en_head_size = "22px"
+    te_body_size = "15px"
+    en_body_size = "14px"
 
 logo_html = (
     f'<img src="data:image/png;base64,{logo_b64}" style="max-height: {logo_max_h}; max-width: 84%; object-fit: contain; display: block; margin: 0 auto;">'
@@ -737,7 +838,7 @@ logo_html = (
     f'<div style="font-size:12px; font-weight:800; color:#1e293b; letter-spacing:1.5px; margin-top:2px;">POWER OF INFORMATION • ఓజస్</div>'
 )
 
-# Photo Grid HTML with Newspaper Frame Graphics & Photo Badges
+# Photo Grid HTML
 photos_html = ""
 if len(photo_b64_list) == 1:
     photos_html = f"""
@@ -828,14 +929,19 @@ pull_quote_html = (
     if pull_quote_text else ""
 )
 
-# Compact paragraph formatting + Editorial Drop-Cap on English Lead
-te_clean_lines = [line.strip() for line in st.session_state["te_body"].split("\n") if line.strip()]
-en_clean_lines = [line.strip() for line in st.session_state["en_body"].split("\n") if line.strip()]
+# Clean any stray asterisks from displayed text
+te_head_clean = st.session_state["te_headline"].replace("*", "").strip()
+en_head_clean = st.session_state["en_headline"].replace("*", "").strip()
+te_sub_clean = st.session_state["te_subhead"].replace("*", "").strip()
+en_sub_clean = st.session_state["en_subhead"].replace("*", "").strip()
+
+te_clean_lines = [line.replace("*", "").strip() for line in st.session_state["te_body"].split("\n") if line.strip()]
+en_clean_lines = [line.replace("*", "").strip() for line in st.session_state["en_body"].split("\n") if line.strip()]
 te_body_formatted = "<br>".join(te_clean_lines)
 en_body_formatted = "<br>".join(en_clean_lines)
 
-te_sub_html = f'<div style="font-size: 13.5px; font-weight: 700; color: {accent_primary}; margin-bottom: 5px; line-height: 1.3; border-left: 3px solid {accent_primary}; padding-left: 7px;">{st.session_state["te_subhead"]}</div>' if st.session_state["te_subhead"].strip() else ""
-en_sub_html = f'<div style="font-size: 12.8px; font-weight: 700; color: {accent_gold}; margin-bottom: 5px; line-height: 1.3; border-left: 3px solid {accent_gold}; padding-left: 7px;">{st.session_state["en_subhead"]}</div>' if st.session_state["en_subhead"].strip() else ""
+te_sub_html = f'<div style="font-size: 13.5px; font-weight: 700; color: {accent_primary}; margin-bottom: 5px; line-height: 1.3; border-left: 3px solid {accent_primary}; padding-left: 7px;">{te_sub_clean}</div>' if te_sub_clean else ""
+en_sub_html = f'<div style="font-size: 12.8px; font-weight: 700; color: {accent_gold}; margin-bottom: 5px; line-height: 1.3; border-left: 3px solid {accent_gold}; padding-left: 7px;">{en_sub_clean}</div>' if en_sub_clean else ""
 
 if layout_mode == "Bilingual Side-by-Side (Telugu + English)":
     news_columns_html = f"""
@@ -846,7 +952,7 @@ if layout_mode == "Bilingual Side-by-Side (Telugu + English)":
                 <span style="flex:1; height:1px; background:#cbd5e1;"></span>
             </div>
             <h2 style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_head_size}; font-weight: 800; color: #0f172a; line-height: 1.24; margin: 0 0 5px 0;">
-                {st.session_state["te_headline"]}
+                {te_head_clean}
             </h2>
             {te_sub_html}
             <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_body_size}; line-height: 1.52; color: #1e293b; text-align: justify;">
@@ -859,7 +965,7 @@ if layout_mode == "Bilingual Side-by-Side (Telugu + English)":
                 <span style="flex:1; height:1px; background:#cbd5e1;"></span>
             </div>
             <h2 style="font-family: 'Merriweather', Georgia, serif; font-size: {en_head_size}; font-weight: 900; color: #0f172a; line-height: 1.22; margin: 0 0 5px 0;">
-                {st.session_state["en_headline"]}
+                {en_head_clean}
             </h2>
             {en_sub_html}
             <div class="en-dropcap" style="font-family: 'Plus Jakarta Sans', sans-serif; font-size: {en_body_size}; line-height: 1.46; color: #1e293b; text-align: justify;">
@@ -873,7 +979,7 @@ elif layout_mode == "Telugu Lead + English Box":
     news_columns_html = f"""
     <div style="margin-top: 6px;">
         <h2 style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_head_size}; font-weight: 800; color: #0f172a; line-height: 1.24; margin: 0 0 5px 0;">
-            {st.session_state["te_headline"]}
+            {te_head_clean}
         </h2>
         {te_sub_html}
         <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_body_size}; line-height: 1.54; color: #1e293b; text-align: justify; column-count: {col_count_te}; column-gap: 18px; column-rule: 1px solid #cbd5e1;">
@@ -881,7 +987,7 @@ elif layout_mode == "Telugu Lead + English Box":
         </div>
         <div style="margin-top: 10px; background: {card_bg}; border-left: 4px solid {accent_primary}; border-top: 1px solid #cbd5e1; border-right: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1; padding: 9px 12px;">
             <div style="font-size: 9.5px; font-weight: 800; color: {accent_primary}; letter-spacing: 0.8px; margin-bottom: 2px;">ENGLISH EDITION</div>
-            <div style="font-family: 'Merriweather', Georgia, serif; font-size: 16px; font-weight: 800; color: #0f172a; margin-bottom: 3px; line-height: 1.22;">{st.session_state["en_headline"]}</div>
+            <div style="font-family: 'Merriweather', Georgia, serif; font-size: 16px; font-weight: 800; color: #0f172a; margin-bottom: 3px; line-height: 1.22;">{en_head_clean}</div>
             <div style="font-size: {en_body_size}; line-height: 1.44; color: #334155; text-align: justify;">{en_body_formatted}</div>
         </div>
     </div>
@@ -891,7 +997,7 @@ else:
     news_columns_html = f"""
     <div style="margin-top: 6px;">
         <h2 style="font-family: 'Merriweather', Georgia, serif; font-size: {en_head_size}; font-weight: 900; color: #0f172a; line-height: 1.22; margin: 0 0 5px 0;">
-            {st.session_state["en_headline"]}
+            {en_head_clean}
         </h2>
         {en_sub_html}
         <div class="en-dropcap" style="font-size: {en_body_size}; line-height: 1.48; color: #1e293b; text-align: justify; column-count: {col_count_en}; column-gap: 18px; column-rule: 1px solid #cbd5e1;">
@@ -899,8 +1005,43 @@ else:
         </div>
         <div style="margin-top: 10px; background: {quote_bg}; border-left: 4px solid {accent_gold}; border-top: 1px solid #fde68a; border-right: 1px solid #fde68a; border-bottom: 1px solid #fde68a; padding: 9px 12px;">
             <div style="font-size: 10px; font-weight: 800; color: {accent_gold}; margin-bottom: 2px;">తెలుగు సంచిక</div>
-            <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: 17px; font-weight: 800; color: #0f172a; margin-bottom: 3px; line-height: 1.24;">{st.session_state["te_headline"]}</div>
+            <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: 17px; font-weight: 800; color: #0f172a; margin-bottom: 3px; line-height: 1.24;">{te_head_clean}</div>
             <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: {te_body_size}; line-height: 1.5; color: #334155; text-align: justify;">{te_body_formatted}</div>
+        </div>
+    </div>
+    """
+
+# Optional 2nd News Item HTML Block (Fills lower broadsheet space seamlessly)
+story2_html = ""
+if st.session_state.get("enable_story_2", False):
+    s2_te_h = st.session_state.get("s2_te_headline", "").replace("*", "").strip()
+    s2_te_b = st.session_state.get("s2_te_body", "").replace("*", "").strip()
+    s2_en_h = st.session_state.get("s2_en_headline", "").replace("*", "").strip()
+    s2_en_b = st.session_state.get("s2_en_body", "").replace("*", "").strip()
+
+    s2_img_block = (
+        f'<div style="margin-bottom:6px; border:1px solid #cbd5e1; padding:3px; background:#fff;">'
+        f'<img src="data:image/jpeg;base64,{s2_photo_b64}" style="width:100%; height:130px; object-fit:cover; display:block;">'
+        f'<div style="font-size:10px; font-weight:700; color:#334155; padding-top:2px;">▲ {s2_photo_cap}</div></div>'
+        if s2_photo_b64 else ""
+    )
+
+    story2_html = f"""
+    <div style="margin-top: 12px; padding-top: 10px; border-top: 2.5px double #1e293b;">
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+            <span style="background:#1e293b; color:#fff; font-size:9.5px; font-weight:800; padding:2px 8px; letter-spacing:0.5px;">OTHER KEY REPORT • మరిన్ని ముఖ్య వార్తలు</span>
+            <span style="flex:1; height:1px; background:#94a3b8;"></span>
+        </div>
+        {s2_img_block}
+        <div style="display: grid; grid-template-columns: 1.08fr 1fr; gap: 16px;">
+            <div style="border-right: 1px solid #cbd5e1; padding-right: 14px;">
+                <h3 style="font-family: 'Noto Sans Telugu', sans-serif; font-size: 17px; font-weight: 800; color: #0f172a; margin: 0 0 4px 0; line-height: 1.25;">{s2_te_h}</h3>
+                <div style="font-family: 'Noto Sans Telugu', sans-serif; font-size: 13.5px; line-height: 1.48; color: #1e293b; text-align: justify;">{s2_te_b}</div>
+            </div>
+            <div>
+                <h3 style="font-family: 'Merriweather', Georgia, serif; font-size: 15.5px; font-weight: 900; color: #0f172a; margin: 0 0 4px 0; line-height: 1.24;">{s2_en_h}</h3>
+                <div style="font-size: 12.8px; line-height: 1.44; color: #1e293b; text-align: justify;">{s2_en_b}</div>
+            </div>
         </div>
     </div>
     """
@@ -908,7 +1049,7 @@ else:
 safe_filename = f"OJAS_News_{pub_date.strftime('%Y%m%d')}"
 escaped_video_url = json.dumps(video_play_url.strip())
 
-# ----------------- RIGHT COLUMN: SINGLE-PAGE LIVE PREVIEW & HD JPEG / PDF EXPORT -----------------
+# ----------------- RIGHT COLUMN: LIVE PREVIEW & AUTO-SIZED JPEG / PDF EXPORT -----------------
 with col_preview:
     st.subheader("🗞️ 2. Print-Grade E-Paper Preview & Export")
 
@@ -1062,7 +1203,7 @@ with col_preview:
             font-size: 10px;
             color: {accent_gold};
             letter-spacing: 4px;
-            margin-top: 6px;
+            margin-top: 8px;
             line-height: 1;
         }}
         .footer-strip {{
@@ -1079,8 +1220,8 @@ with col_preview:
     </head>
     <body>
         <div class="toolbar">
-            <button class="btn btn-jpg" onclick="downloadJPEG()">🖼️ Download Single-Page HD JPEG</button>
-            <button class="btn btn-pdf" onclick="downloadPDF()">📄 Download Single-Page PDF</button>
+            <button class="btn btn-jpg" onclick="downloadJPEG()">🖼️ Download HD JPEG</button>
+            <button class="btn btn-pdf" onclick="downloadPDF()">📄 Download Exact-Fit PDF</button>
         </div>
         <div id="status-msg"></div>
 
@@ -1117,6 +1258,8 @@ with col_preview:
                         {pull_quote_html}
 
                         {news_columns_html}
+
+                        {story2_html}
                     </div>
 
                     <div>
@@ -1157,7 +1300,7 @@ with col_preview:
 
             async function renderMasterCanvas() {{
                 const status = document.getElementById('status-msg');
-                status.innerText = "⏳ Rendering single-page print edition...";
+                status.innerText = "⏳ Rendering high-resolution print edition...";
                 await document.fonts.ready;
 
                 const holder = document.getElementById('scale-holder');
@@ -1165,10 +1308,11 @@ with col_preview:
                 holder.style.transform = "scale(1)";
 
                 const element = document.getElementById('newspaper-sheet');
+                const exactHeight = element.offsetHeight;
                 const canvas = await html2canvas(element, {{
                     scale: 2,
                     width: MASTER_WIDTH,
-                    height: element.offsetHeight,
+                    height: exactHeight,
                     windowWidth: MASTER_WIDTH + 40,
                     useCORS: true,
                     backgroundColor: "{bg_paper}",
@@ -1187,7 +1331,7 @@ with col_preview:
                     link.download = "{safe_filename}.jpg";
                     link.href = canvas.toDataURL("image/jpeg", 0.96);
                     link.click();
-                    document.getElementById('status-msg').innerText = "✅ Single-page HD JPEG downloaded!";
+                    document.getElementById('status-msg').innerText = "✅ Zero-blank-space HD JPEG downloaded!";
                 }} catch (err) {{
                     document.getElementById('status-msg').innerText = "⚠️ Error: " + err;
                 }}
@@ -1207,20 +1351,21 @@ with col_preview:
                     const imgData = canvas.toDataURL("image/jpeg", 0.96);
                     const {{ jsPDF }} = window.jspdf;
 
+                    // Dynamically match PDF page height to the exact captured sheet ratio so zero blank space remains!
+                    const pdfWidthMm = 210; // Standard A4 width in mm
+                    const pdfHeightMm = (canvas.height * pdfWidthMm) / canvas.width;
+
                     const pdf = new jsPDF({{
-                        orientation: "portrait",
+                        orientation: pdfHeightMm >= pdfWidthMm ? "portrait" : "landscape",
                         unit: "mm",
-                        format: {pdf_format_js}
+                        format: [pdfWidthMm, pdfHeightMm]
                     }});
 
-                    const pageWidth = pdf.internal.pageSize.getWidth();
-                    const pageHeight = pdf.internal.pageSize.getHeight();
-
-                    pdf.addImage(imgData, "JPEG", 0, 0, pageWidth, pageHeight);
+                    pdf.addImage(imgData, "JPEG", 0, 0, pdfWidthMm, pdfHeightMm);
 
                     if (videoRect && VIDEO_URL) {{
-                        const scaleX = pageWidth / sheetRect.width;
-                        const scaleY = pageHeight / sheetRect.height;
+                        const scaleX = pdfWidthMm / sheetRect.width;
+                        const scaleY = pdfHeightMm / sheetRect.height;
                         pdf.link(
                             (videoRect.left - sheetRect.left) * scaleX,
                             (videoRect.top - sheetRect.top) * scaleY,
@@ -1231,7 +1376,7 @@ with col_preview:
                     }}
 
                     pdf.save("{safe_filename}.pdf");
-                    document.getElementById('status-msg').innerText = "✅ Single-page PDF downloaded!";
+                    document.getElementById('status-msg').innerText = "✅ Exact-fit PDF downloaded (zero blank gap)!";
                 }} catch (err) {{
                     document.getElementById('status-msg').innerText = "⚠️ Error: " + err;
                 }}
@@ -1241,4 +1386,4 @@ with col_preview:
     </html>
     """
 
-    components.html(newspaper_widget_html, height=1120, scrolling=False)
+    components.html(newspaper_widget_html, height=1180, scrolling=True)
